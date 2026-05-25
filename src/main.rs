@@ -64,9 +64,22 @@ enum ViewMode {
     FullFile,
 }
 
+/// What we diff against.
+#[derive(Clone, Copy, PartialEq)]
+enum DiffSource {
+    /// Working tree (incl. index + untracked) vs HEAD — local uncommitted work.
+    WorkingTree,
+    /// `base...HEAD` three-dot: merge-base(base, HEAD) tree vs HEAD tree.
+    /// This is what a PR shows — only what this branch introduced.
+    BranchRange,
+}
+
 struct App {
     repo_path: PathBuf,
     branch: String,
+    base: String,
+    base_input: String,
+    source: DiffSource,
     files: Vec<ChangedFile>,
     selected: Option<usize>,
     view: ViewMode,
@@ -83,6 +96,9 @@ impl App {
         let mut app = App {
             repo_path,
             branch: String::new(),
+            base: String::new(),
+            base_input: String::new(),
+            source: DiffSource::WorkingTree,
             files: Vec::new(),
             selected: None,
             view: ViewMode::Diff,
@@ -91,8 +107,24 @@ impl App {
             cache: Vec::new(),
             cache_key: None,
         };
+        // Guess a sensible default base for branch-range mode.
+        app.base = app.guess_default_base();
+        app.base_input = app.base.clone();
         app.reload();
         app
+    }
+
+    /// Pick a default base branch: first of main / master / develop / trunk
+    /// that resolves in the repo, else "main".
+    fn guess_default_base(&self) -> String {
+        if let Ok(repo) = Repository::discover(&self.repo_path) {
+            for cand in ["main", "master", "develop", "trunk"] {
+                if repo.revparse_single(cand).is_ok() {
+                    return cand.to_string();
+                }
+            }
+        }
+        "main".to_string()
     }
 
     fn reload(&mut self) {
@@ -128,8 +160,21 @@ impl App {
             .include_untracked(true)
             .recurse_untracked_dirs(true);
 
-        let diff: Diff =
-            repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))?;
+        let diff: Diff = match self.source {
+            DiffSource::WorkingTree => {
+                repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))?
+            }
+            DiffSource::BranchRange => {
+                // base...HEAD three-dot: diff from merge-base(base, HEAD) to HEAD.
+                let base_obj = repo.revparse_single(&self.base)?;
+                let base_commit = base_obj.peel_to_commit()?;
+                let head_commit = repo.head()?.peel_to_commit()?;
+                let mb = repo.merge_base(base_commit.id(), head_commit.id())?;
+                let mb_tree = repo.find_commit(mb)?.tree()?;
+                let head_t = head_commit.tree()?;
+                repo.diff_tree_to_tree(Some(&mb_tree), Some(&head_t), Some(&mut opts))?
+            }
+        };
 
         use std::cell::RefCell;
         let files: RefCell<Vec<ChangedFile>> = RefCell::new(Vec::new());
@@ -245,6 +290,35 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.view, ViewMode::FullFile, "Full File");
                     ui.selectable_value(&mut self.view, ViewMode::Diff, "Diff");
                 });
+            });
+            ui.horizontal(|ui| {
+                ui.label("source:");
+                let mut changed = false;
+                changed |= ui
+                    .selectable_value(&mut self.source, DiffSource::WorkingTree, "Working Tree")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut self.source, DiffSource::BranchRange, "Branch Range")
+                    .changed();
+                if self.source == DiffSource::BranchRange {
+                    ui.separator();
+                    ui.label("base:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.base_input)
+                            .desired_width(140.0)
+                            .hint_text("main"),
+                    );
+                    let apply = ui.button("apply").clicked()
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if apply {
+                        self.base = self.base_input.trim().to_string();
+                        changed = true;
+                    }
+                    ui.weak(format!("{}...HEAD", self.base));
+                }
+                if changed {
+                    self.reload();
+                }
             });
         });
 
