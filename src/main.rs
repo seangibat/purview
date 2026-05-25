@@ -44,7 +44,6 @@ enum LineKind {
     Add,
     Del,
     Ctx,
-    Hunk,
 }
 
 /// A diff line: its kind plus the raw text (highlighting applied at render
@@ -55,9 +54,37 @@ struct DiffLineRow {
     text: String,
 }
 
+/// Per-hunk review decision. The unit of review is the hunk — small enough
+/// to judge, large enough to be meaningful.
+#[derive(Clone, Copy, PartialEq)]
+enum ReviewStatus {
+    Unreviewed,
+    Approved,
+    Rejected,
+}
+
+struct Hunk {
+    header: String,
+    rows: Vec<DiffLineRow>,
+    status: ReviewStatus,
+}
+
 struct ChangedFile {
     path: String,
-    diff_rows: Vec<DiffLineRow>,
+    hunks: Vec<Hunk>,
+}
+
+impl ChangedFile {
+    /// (reviewed, total) hunk counts for the progress indicator.
+    fn progress(&self) -> (usize, usize) {
+        let total = self.hunks.len();
+        let reviewed = self
+            .hunks
+            .iter()
+            .filter(|h| h.status != ReviewStatus::Unreviewed)
+            .count();
+        (reviewed, total)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -72,6 +99,20 @@ enum ViewMode {
 enum Selection {
     Changed(usize),
     Path(String),
+}
+
+/// One rendered row in the content pane (post-highlight, ready to draw).
+enum RenderRow {
+    /// A hunk boundary in diff view. Carries the hunk index so the row can
+    /// draw approve/deny controls bound to that hunk's live status.
+    HunkHeader { hunk_idx: usize, text: String },
+    /// A diff content line (add/del/ctx) with highlighted spans.
+    DiffLine {
+        kind: LineKind,
+        spans: Vec<(Color32, String)>,
+    },
+    /// A full-file content line with highlighted spans.
+    Plain { spans: Vec<(Color32, String)> },
 }
 
 /// What we diff against.
@@ -96,9 +137,8 @@ struct App {
     tree: FileTree,
     error: Option<String>,
     hl: Highlighter,
-    /// Cached highlighted spans for the currently-shown content, one entry
-    /// per visual row: (kind-or-None, Vec<(color, text)>).
-    cache: Vec<(Option<LineKind>, Vec<(Color32, String)>)>,
+    /// Cached, highlighted, render-ready rows for the current selection/view.
+    cache: Vec<RenderRow>,
     cache_key: Option<(Selection, ViewMode)>,
 }
 
@@ -207,28 +247,57 @@ impl App {
             if files.last().map(|f| f.path != path).unwrap_or(true) {
                 files.push(ChangedFile {
                     path: path.clone(),
-                    diff_rows: Vec::new(),
+                    hunks: Vec::new(),
                 });
             }
             let content = String::from_utf8_lossy(line.content())
                 .trim_end_matches('\n')
                 .to_string();
-            let kind = match line.origin() {
-                '+' => LineKind::Add,
-                '-' => LineKind::Del,
-                'H' => LineKind::Hunk,
-                'F' => return true,
-                _ => LineKind::Ctx,
-            };
-            files
-                .last_mut()
-                .unwrap()
-                .diff_rows
-                .push(DiffLineRow { kind, text: content });
+
+            let file = files.last_mut().unwrap();
+            match line.origin() {
+                'F' => {} // file header — skip; we key on delta path
+                'H' => {
+                    // Hunk header — start a fresh hunk.
+                    file.hunks.push(Hunk {
+                        header: content,
+                        rows: Vec::new(),
+                        status: ReviewStatus::Unreviewed,
+                    });
+                }
+                origin => {
+                    let kind = match origin {
+                        '+' => LineKind::Add,
+                        '-' => LineKind::Del,
+                        _ => LineKind::Ctx,
+                    };
+                    // Content before any hunk header (rare) gets a synthetic hunk.
+                    if file.hunks.is_empty() {
+                        file.hunks.push(Hunk {
+                            header: String::new(),
+                            rows: Vec::new(),
+                            status: ReviewStatus::Unreviewed,
+                        });
+                    }
+                    file.hunks
+                        .last_mut()
+                        .unwrap()
+                        .rows
+                        .push(DiffLineRow { kind, text: content });
+                }
+            }
             true
         })?;
 
         Ok((branch, files.into_inner()))
+    }
+
+    /// (reviewed, total) hunks across all changed files.
+    fn review_totals(&self) -> (usize, usize) {
+        self.files.iter().fold((0, 0), |(r, t), f| {
+            let (fr, ft) = f.progress();
+            (r + fr, t + ft)
+        })
     }
 
     /// Read the full working-tree file for the selected path.
@@ -257,21 +326,24 @@ impl App {
             return;
         }
 
-        let mut out: Vec<(Option<LineKind>, Vec<(Color32, String)>)> = Vec::new();
+        let mut out: Vec<RenderRow> = Vec::new();
 
         match (&sel, effective_view) {
             (Selection::Changed(idx), ViewMode::Diff) => {
                 let path = self.files[*idx].path.clone();
-                let rows = self.files[*idx].diff_rows.clone();
-                for r in rows {
-                    if r.kind == LineKind::Hunk {
-                        out.push((
-                            Some(LineKind::Hunk),
-                            vec![(Color32::from_rgb(120, 160, 220), r.text)],
-                        ));
-                    } else {
+                // Clone the lightweight structure we need so we can borrow
+                // self.hl immutably while iterating.
+                let hunks: Vec<(usize, String, Vec<DiffLineRow>)> = self.files[*idx]
+                    .hunks
+                    .iter()
+                    .enumerate()
+                    .map(|(hi, h)| (hi, h.header.clone(), h.rows.clone()))
+                    .collect();
+                for (hunk_idx, header, rows) in hunks {
+                    out.push(RenderRow::HunkHeader { hunk_idx, text: header });
+                    for r in rows {
                         let spans = self.hl.highlight_line(&path, &r.text);
-                        out.push((Some(r.kind), spans));
+                        out.push(RenderRow::DiffLine { kind: r.kind, spans });
                     }
                 }
             }
@@ -284,13 +356,12 @@ impl App {
                     Ok(content) => {
                         for line in content.lines() {
                             let spans = self.hl.highlight_line(&path, line);
-                            out.push((None, spans));
+                            out.push(RenderRow::Plain { spans });
                         }
                     }
-                    Err(e) => out.push((
-                        None,
-                        vec![(Color32::LIGHT_RED, format!("cannot read file: {e}"))],
-                    )),
+                    Err(e) => out.push(RenderRow::Plain {
+                        spans: vec![(Color32::LIGHT_RED, format!("cannot read file: {e}"))],
+                    }),
                 }
             }
             // (Path, Diff) is impossible — forced to FullFile above.
@@ -311,6 +382,9 @@ impl eframe::App for App {
                 ui.label(format!("repo: {}", self.repo_path.to_string_lossy()));
                 ui.separator();
                 ui.label(format!("branch: {}", self.branch));
+                ui.separator();
+                let (rev, tot) = self.review_totals();
+                ui.label(format!("reviewed: {rev}/{tot} hunks"));
                 ui.separator();
                 ui.label("session: (none)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -369,7 +443,15 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         for i in 0..self.files.len() {
                             let selected = self.selected == Some(Selection::Changed(i));
-                            let label = self.files[i].path.clone();
+                            let (reviewed, total) = self.files[i].progress();
+                            let glyph = if total > 0 && reviewed == total {
+                                "✓"
+                            } else if reviewed > 0 {
+                                "◐"
+                            } else {
+                                "○"
+                            };
+                            let label = format!("{glyph} {}", self.files[i].path);
                             if ui.selectable_label(selected, label).clicked() {
                                 self.selected = Some(Selection::Changed(i));
                             }
@@ -397,6 +479,15 @@ impl eframe::App for App {
 
         self.ensure_cache();
 
+        // The file whose hunks the controls mutate (only in Changed+Diff).
+        let active_file = match &self.selected {
+            Some(Selection::Changed(i)) => Some(*i),
+            _ => None,
+        };
+        // Pending status changes collected during render, applied after (so
+        // the render closure only needs immutable borrows of self).
+        let mut pending: Vec<(usize, ReviewStatus)> = Vec::new();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.selected.is_none() {
                 ui.centered_and_justified(|ui| {
@@ -414,43 +505,96 @@ impl eframe::App for App {
                 |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for i in range {
-                        let (kind, spans) = &self.cache[i];
-                        let bg = match kind {
-                            Some(LineKind::Add) => Some(Color32::from_rgb(22, 50, 22)),
-                            Some(LineKind::Del) => Some(Color32::from_rgb(55, 22, 22)),
-                            _ => None,
-                        };
-                        let gutter = match kind {
-                            Some(LineKind::Add) => "+ ",
-                            Some(LineKind::Del) => "- ",
-                            Some(LineKind::Hunk) => "",
-                            _ => "  ",
-                        };
-                        let draw = |ui: &mut egui::Ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                if !gutter.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(gutter)
-                                            .monospace()
-                                            .color(Color32::DARK_GRAY),
-                                    );
+                        match &self.cache[i] {
+                            RenderRow::HunkHeader { hunk_idx, text } => {
+                                let status = active_file
+                                    .and_then(|f| self.files[f].hunks.get(*hunk_idx))
+                                    .map(|h| h.status)
+                                    .unwrap_or(ReviewStatus::Unreviewed);
+                                egui::Frame::none()
+                                    .fill(Color32::from_rgb(30, 36, 48))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let (glyph, col) = match status {
+                                                ReviewStatus::Approved => {
+                                                    ("✓", Color32::from_rgb(120, 200, 120))
+                                                }
+                                                ReviewStatus::Rejected => {
+                                                    ("✗", Color32::from_rgb(220, 120, 120))
+                                                }
+                                                ReviewStatus::Unreviewed => {
+                                                    ("○", Color32::DARK_GRAY)
+                                                }
+                                            };
+                                            ui.label(egui::RichText::new(glyph).color(col));
+                                            if ui.small_button("approve").clicked() {
+                                                pending.push((*hunk_idx, ReviewStatus::Approved));
+                                            }
+                                            if ui.small_button("reject").clicked() {
+                                                pending.push((*hunk_idx, ReviewStatus::Rejected));
+                                            }
+                                            if status != ReviewStatus::Unreviewed
+                                                && ui.small_button("clear").clicked()
+                                            {
+                                                pending
+                                                    .push((*hunk_idx, ReviewStatus::Unreviewed));
+                                            }
+                                            ui.label(
+                                                egui::RichText::new(text)
+                                                    .monospace()
+                                                    .color(Color32::from_rgb(120, 160, 220)),
+                                            );
+                                        });
+                                    });
+                            }
+                            RenderRow::DiffLine { kind, spans } => {
+                                let (bg, gutter) = match kind {
+                                    LineKind::Add => {
+                                        (Some(Color32::from_rgb(22, 50, 22)), "+ ")
+                                    }
+                                    LineKind::Del => {
+                                        (Some(Color32::from_rgb(55, 22, 22)), "- ")
+                                    }
+                                    _ => (None, "  "),
+                                };
+                                let draw = |ui: &mut egui::Ui| line_row(ui, gutter, spans);
+                                if let Some(bg) = bg {
+                                    egui::Frame::none().fill(bg).show(ui, draw);
+                                } else {
+                                    draw(ui);
                                 }
-                                for (color, text) in spans {
-                                    ui.label(egui::RichText::new(text).monospace().color(*color));
-                                }
-                            });
-                        };
-                        if let Some(bg) = bg {
-                            egui::Frame::none().fill(bg).show(ui, draw);
-                        } else {
-                            draw(ui);
+                            }
+                            RenderRow::Plain { spans } => {
+                                line_row(ui, "", spans);
+                            }
                         }
                     }
                 },
             );
         });
+
+        // Apply review-status changes collected during render.
+        if let (Some(f), false) = (active_file, pending.is_empty()) {
+            for (hunk_idx, status) in pending {
+                if let Some(h) = self.files[f].hunks.get_mut(hunk_idx) {
+                    h.status = status;
+                }
+            }
+        }
     }
+}
+
+/// Draw a single monospace content line: optional gutter + highlighted spans.
+fn line_row(ui: &mut egui::Ui, gutter: &str, spans: &[(Color32, String)]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if !gutter.is_empty() {
+            ui.label(egui::RichText::new(gutter).monospace().color(Color32::DARK_GRAY));
+        }
+        for (color, text) in spans {
+            ui.label(egui::RichText::new(text).monospace().color(*color));
+        }
+    });
 }
 
 /// Recursively render the lazy file tree. Directories expand on click
