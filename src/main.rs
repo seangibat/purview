@@ -17,7 +17,7 @@ use git2::{Diff, DiffFormat, DiffOptions, Repository};
 mod highlight;
 mod tree;
 use highlight::Highlighter;
-use purview::review_state::{FileState, HunkState, ReviewState};
+use purview::review_state::{FileState, HunkState, Replies, ReviewState};
 use tree::{FileTree, Node};
 
 fn main() -> eframe::Result<()> {
@@ -68,6 +68,18 @@ struct Hunk {
     header: String,
     rows: Vec<DiffLineRow>,
     status: ReviewStatus,
+    comment: String,
+}
+
+impl Hunk {
+    fn new(header: String) -> Self {
+        Hunk {
+            header,
+            rows: Vec::new(),
+            status: ReviewStatus::Unreviewed,
+            comment: String::new(),
+        }
+    }
 }
 
 struct ChangedFile {
@@ -134,6 +146,8 @@ struct App {
     source: DiffSource,
     files: Vec<ChangedFile>,
     selected: Option<Selection>,
+    /// Hunk index whose comment editor is open in the bottom panel.
+    active_hunk: Option<usize>,
     view: ViewMode,
     tree: FileTree,
     error: Option<String>,
@@ -161,6 +175,7 @@ impl App {
             source: DiffSource::WorkingTree,
             files: Vec::new(),
             selected: None,
+            active_hunk: None,
             view: ViewMode::Diff,
             tree: FileTree::new(tree_root),
             error: None,
@@ -193,6 +208,7 @@ impl App {
     fn reload(&mut self) {
         self.files.clear();
         self.selected = None;
+        self.active_hunk = None;
         self.error = None;
         self.report_note.clear();
         self.cache.clear();
@@ -266,22 +282,14 @@ impl App {
                 'B' => {
                     // Binary delta — no reviewable text. Single placeholder hunk.
                     if file.hunks.is_empty() {
-                        file.hunks.push(Hunk {
-                            header: "(binary file)".to_string(),
-                            rows: Vec::new(),
-                            status: ReviewStatus::Unreviewed,
-                        });
+                        file.hunks.push(Hunk::new("(binary file)".to_string()));
                     }
                 }
                 'H' => {
                     let content = String::from_utf8_lossy(line.content())
                         .trim_end_matches('\n')
                         .to_string();
-                    file.hunks.push(Hunk {
-                        header: content,
-                        rows: Vec::new(),
-                        status: ReviewStatus::Unreviewed,
-                    });
+                    file.hunks.push(Hunk::new(content));
                 }
                 origin => {
                     let content = String::from_utf8_lossy(line.content())
@@ -294,11 +302,7 @@ impl App {
                     };
                     // Content before any hunk header (rare) gets a synthetic hunk.
                     if file.hunks.is_empty() {
-                        file.hunks.push(Hunk {
-                            header: String::new(),
-                            rows: Vec::new(),
-                            status: ReviewStatus::Unreviewed,
-                        });
+                        file.hunks.push(Hunk::new(String::new()));
                     }
                     file.hunks
                         .last_mut()
@@ -414,7 +418,11 @@ impl App {
                                 ReviewStatus::Unreviewed => "unreviewed",
                             }
                             .to_string(),
-                            comment: None,
+                            comment: if h.comment.trim().is_empty() {
+                                None
+                            } else {
+                                Some(h.comment.clone())
+                            },
                         })
                         .collect(),
                 })
@@ -638,6 +646,59 @@ impl eframe::App for App {
         // Pending status changes collected during render, applied after (so
         // the render closure only needs immutable borrows of self).
         let mut pending: Vec<(usize, ReviewStatus)> = Vec::new();
+        // Hunk whose comment button was clicked this frame (opens the editor).
+        let mut open_comment: Option<usize> = None;
+
+        // Bottom panel: comment editor for the active hunk. Rendered before
+        // the central panel's scroll so it claims its space; the &mut borrow
+        // of self.files is fine here (no cache borrow in scope yet).
+        if let (Some(f), Some(h)) = (active_file, self.active_hunk) {
+            let header = self.files[f].hunks.get(h).map(|hk| hk.header.clone());
+            if let Some(header) = header {
+                let mut changed = false;
+                egui::TopBottomPanel::bottom("comment").resizable(true).show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Comment").strong());
+                        ui.weak(header.trim().to_string());
+                        if ui.small_button("close").clicked() {
+                            self.active_hunk = None;
+                        }
+                    });
+                    let file_path = self.files[f].path.clone();
+                    if let Some(hunk) = self.files[f].hunks.get_mut(h) {
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut hunk.comment)
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("why this needs changing / a question for the agent"),
+                        );
+                        changed = resp.changed();
+                    }
+                    // Agent replies on this hunk's thread (written by the MCP
+                    // server to replies.json). Poll ~1/s while the panel's open
+                    // so a reply posted by the agent shows up without a click.
+                    ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                    let replies = Replies::load(&self.tree.root);
+                    let thread = replies.for_hunk(&file_path, &header);
+                    if !thread.is_empty() {
+                        ui.separator();
+                        egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                            for r in thread {
+                                ui.label(
+                                    egui::RichText::new("agent")
+                                        .small()
+                                        .color(Color32::from_rgb(120, 160, 220)),
+                                );
+                                ui.label(&r.text);
+                            }
+                        });
+                    }
+                });
+                if changed {
+                    self.save_review_state();
+                }
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.selected.is_none() {
@@ -690,6 +751,14 @@ impl eframe::App for App {
                                                 pending
                                                     .push((*hunk_idx, ReviewStatus::Unreviewed));
                                             }
+                                            let has_comment = active_file
+                                                .and_then(|f| self.files[f].hunks.get(*hunk_idx))
+                                                .map(|h| !h.comment.trim().is_empty())
+                                                .unwrap_or(false);
+                                            let cbtn = if has_comment { "💬*" } else { "💬" };
+                                            if ui.small_button(cbtn).clicked() {
+                                                open_comment = Some(*hunk_idx);
+                                            }
                                             ui.label(
                                                 egui::RichText::new(text)
                                                     .monospace()
@@ -733,6 +802,9 @@ impl eframe::App for App {
                 }
             }
             self.save_review_state();
+        }
+        if let Some(h) = open_comment {
+            self.active_hunk = Some(h);
         }
     }
 }

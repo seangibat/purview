@@ -12,7 +12,7 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-use purview::review_state::ReviewState;
+use purview::review_state::{Replies, Reply, ReviewState};
 use serde_json::{json, Value};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -58,12 +58,13 @@ fn main() {
                 "result": { "tools": tool_specs() }
             })),
             "tools/call" => {
-                let name = msg
-                    .get("params")
+                let params = msg.get("params");
+                let name = params
                     .and_then(|p| p.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or("");
-                Some(call_tool(&repo_root, name, id))
+                let args = params.and_then(|p| p.get("arguments")).cloned();
+                Some(call_tool(&repo_root, name, args, id))
             }
             // notifications/initialized and other notifications: ignore.
             _ if id.is_none() => None,
@@ -99,10 +100,28 @@ fn tool_specs() -> Value {
             "description": "Just the hunks the reviewer rejected (need changes), grouped by file. Use this to know what to fix.",
             "inputSchema": empty,
         },
+        {
+            "name": "reply_to_comment",
+            "description": "Post a reply to the reviewer on a specific hunk's comment thread. The reply appears inline in purview. Identify the hunk by its file path and hunk header (both from get_review_state).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "File path, exactly as in get_review_state." },
+                    "hunk_header": { "type": "string", "description": "The hunk's header line, exactly as in get_review_state." },
+                    "text": { "type": "string", "description": "Your reply." }
+                },
+                "required": ["file", "hunk_header", "text"]
+            },
+        },
     ])
 }
 
-fn call_tool(repo_root: &std::path::Path, name: &str, id: Option<Value>) -> Value {
+fn call_tool(
+    repo_root: &std::path::Path,
+    name: &str,
+    args: Option<Value>,
+    id: Option<Value>,
+) -> Value {
     let text = match name {
         "get_review_state" => match ReviewState::load(repo_root) {
             Ok(state) => serde_json::to_string_pretty(&state)
@@ -141,6 +160,26 @@ fn call_tool(repo_root: &std::path::Path, name: &str, id: Option<Value>) -> Valu
             }
             Err(e) => return tool_error(id, &format!("no review state: {e}")),
         },
+        "reply_to_comment" => {
+            let args = args.unwrap_or(Value::Null);
+            let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let hunk_header = args.get("hunk_header").and_then(|v| v.as_str()).unwrap_or("");
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if file.is_empty() || hunk_header.is_empty() || text.is_empty() {
+                return tool_error(id, "reply_to_comment requires file, hunk_header, text");
+            }
+            match Replies::append(
+                repo_root,
+                Reply {
+                    file: file.to_string(),
+                    hunk_header: hunk_header.to_string(),
+                    text: text.to_string(),
+                },
+            ) {
+                Ok(()) => "reply posted".to_string(),
+                Err(e) => return tool_error(id, &format!("failed to post reply: {e}")),
+            }
+        }
         other => return tool_error(id, &format!("unknown tool: {other}")),
     };
 

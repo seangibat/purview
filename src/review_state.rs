@@ -29,6 +29,54 @@ pub struct HunkState {
     pub comment: Option<String>,
 }
 
+/// A reply posted by the connected agent (via the MCP `reply_to_comment`
+/// tool) against a specific hunk's comment. Stored in a SEPARATE file from
+/// ReviewState so the GUI (which owns review-state.json) and the MCP server
+/// (which owns replies.json) never clobber each other's writes.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Reply {
+    pub file: String,
+    pub hunk_header: String,
+    pub text: String,
+}
+
+/// Append-only log of agent replies. Read by the GUI to render threads.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Replies {
+    pub replies: Vec<Reply>,
+}
+
+impl Replies {
+    pub fn path_for(repo_root: &Path) -> PathBuf {
+        repo_root.join(".purview").join("replies.json")
+    }
+
+    pub fn load(repo_root: &Path) -> Self {
+        std::fs::read_to_string(Self::path_for(repo_root))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn append(repo_root: &Path, reply: Reply) -> std::io::Result<()> {
+        let dir = repo_root.join(".purview");
+        std::fs::create_dir_all(&dir)?;
+        let mut all = Self::load(repo_root);
+        all.replies.push(reply);
+        let json = serde_json::to_string_pretty(&all)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(Self::path_for(repo_root), json)
+    }
+
+    /// Replies matching a given file + hunk header, in order.
+    pub fn for_hunk<'a>(&'a self, file: &str, hunk_header: &str) -> Vec<&'a Reply> {
+        self.replies
+            .iter()
+            .filter(|r| r.file == file && r.hunk_header == hunk_header)
+            .collect()
+    }
+}
+
 impl ReviewState {
     /// `<repo_root>/.purview/review-state.json`.
     pub fn path_for(repo_root: &Path) -> PathBuf {
