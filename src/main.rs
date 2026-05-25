@@ -12,13 +12,12 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use egui::Color32;
-use git2::{Diff, DiffFormat, DiffOptions, Repository};
+use git2::Repository;
 
-mod highlight;
-mod tree;
-use highlight::Highlighter;
+use purview::diff::{self, ChangedFile, DiffSource, Hunk, LineKind, ReviewStatus};
+use purview::highlight::Highlighter;
 use purview::review_state::{FileState, HunkState, Replies, ReviewState};
-use tree::{FileTree, Node};
+use purview::tree::{FileTree, Node};
 
 fn main() -> eframe::Result<()> {
     let repo_path = std::env::args()
@@ -38,66 +37,6 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |_cc| Ok(Box::new(App::new(repo_path)))),
     )
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum LineKind {
-    Add,
-    Del,
-    Ctx,
-}
-
-/// A diff line: its kind plus the raw text (highlighting applied at render
-/// time from the cached per-file highlight, keyed by line content).
-#[derive(Clone)]
-struct DiffLineRow {
-    kind: LineKind,
-    text: String,
-}
-
-/// Per-hunk review decision. The unit of review is the hunk — small enough
-/// to judge, large enough to be meaningful.
-#[derive(Clone, Copy, PartialEq)]
-enum ReviewStatus {
-    Unreviewed,
-    Approved,
-    Rejected,
-}
-
-struct Hunk {
-    header: String,
-    rows: Vec<DiffLineRow>,
-    status: ReviewStatus,
-    comment: String,
-}
-
-impl Hunk {
-    fn new(header: String) -> Self {
-        Hunk {
-            header,
-            rows: Vec::new(),
-            status: ReviewStatus::Unreviewed,
-            comment: String::new(),
-        }
-    }
-}
-
-struct ChangedFile {
-    path: String,
-    hunks: Vec<Hunk>,
-}
-
-impl ChangedFile {
-    /// (reviewed, total) hunk counts for the progress indicator.
-    fn progress(&self) -> (usize, usize) {
-        let total = self.hunks.len();
-        let reviewed = self
-            .hunks
-            .iter()
-            .filter(|h| h.status != ReviewStatus::Unreviewed)
-            .count();
-        (reviewed, total)
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -126,16 +65,6 @@ enum RenderRow {
     },
     /// A full-file content line with highlighted spans.
     Plain { spans: Vec<(Color32, String)> },
-}
-
-/// What we diff against.
-#[derive(Clone, Copy, PartialEq)]
-enum DiffSource {
-    /// Working tree (incl. index + untracked) vs HEAD — local uncommitted work.
-    WorkingTree,
-    /// `base...HEAD` three-dot: merge-base(base, HEAD) tree vs HEAD tree.
-    /// This is what a PR shows — only what this branch introduced.
-    BranchRange,
 }
 
 struct App {
@@ -228,93 +157,7 @@ impl App {
     }
 
     fn compute_diff(&self) -> Result<(String, Vec<ChangedFile>), git2::Error> {
-        let repo = Repository::discover(&self.repo_path)?;
-        let branch = repo
-            .head()
-            .ok()
-            .and_then(|h| h.shorthand().map(String::from))
-            .unwrap_or_else(|| "(detached)".into());
-        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-
-        let mut opts = DiffOptions::new();
-        opts.context_lines(3)
-            .include_untracked(true)
-            .recurse_untracked_dirs(true);
-
-        let diff: Diff = match self.source {
-            DiffSource::WorkingTree => {
-                repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))?
-            }
-            DiffSource::BranchRange => {
-                // base...HEAD three-dot: diff from merge-base(base, HEAD) to HEAD.
-                let base_obj = repo.revparse_single(&self.base)?;
-                let base_commit = base_obj.peel_to_commit()?;
-                let head_commit = repo.head()?.peel_to_commit()?;
-                let mb = repo.merge_base(base_commit.id(), head_commit.id())?;
-                let mb_tree = repo.find_commit(mb)?.tree()?;
-                let head_t = head_commit.tree()?;
-                repo.diff_tree_to_tree(Some(&mb_tree), Some(&head_t), Some(&mut opts))?
-            }
-        };
-
-        // diff.print's callback is FnMut, so a plain captured &mut Vec works
-        // — no RefCell needed.
-        let mut files: Vec<ChangedFile> = Vec::new();
-
-        diff.print(DiffFormat::Patch, |delta, _hunk, line| {
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "<unknown>".into());
-
-            if files.last().map(|f| f.path != path).unwrap_or(true) {
-                files.push(ChangedFile {
-                    path: path.clone(),
-                    hunks: Vec::new(),
-                });
-            }
-
-            let file = files.last_mut().unwrap();
-            match line.origin() {
-                'F' => {} // file header — skip; we key on delta path
-                'B' => {
-                    // Binary delta — no reviewable text. Single placeholder hunk.
-                    if file.hunks.is_empty() {
-                        file.hunks.push(Hunk::new("(binary file)".to_string()));
-                    }
-                }
-                'H' => {
-                    let content = String::from_utf8_lossy(line.content())
-                        .trim_end_matches('\n')
-                        .to_string();
-                    file.hunks.push(Hunk::new(content));
-                }
-                origin => {
-                    let content = String::from_utf8_lossy(line.content())
-                        .trim_end_matches('\n')
-                        .to_string();
-                    let kind = match origin {
-                        '+' => LineKind::Add,
-                        '-' => LineKind::Del,
-                        _ => LineKind::Ctx,
-                    };
-                    // Content before any hunk header (rare) gets a synthetic hunk.
-                    if file.hunks.is_empty() {
-                        file.hunks.push(Hunk::new(String::new()));
-                    }
-                    file.hunks
-                        .last_mut()
-                        .unwrap()
-                        .rows
-                        .push(DiffLineRow { kind, text: content });
-                }
-            }
-            true
-        })?;
-
-        Ok((branch, files))
+        diff::compute(&self.repo_path, self.source, &self.base)
     }
 
     /// (reviewed, total) hunks across all changed files.

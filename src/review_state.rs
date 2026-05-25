@@ -149,3 +149,88 @@ impl ReviewState {
         (reviewed, total)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("purview-rs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn sample() -> ReviewState {
+        ReviewState {
+            branch: "feature".into(),
+            range: "main...HEAD".into(),
+            files: vec![FileState {
+                path: "src/a.rs".into(),
+                hunks: vec![
+                    HunkState { header: "@@ -1 +1 @@".into(), status: "approved".into(), comment: None },
+                    HunkState { header: "@@ -9 +9 @@".into(), status: "rejected".into(), comment: Some("why".into()) },
+                    HunkState { header: "@@ -20 +20 @@".into(), status: "unreviewed".into(), comment: None },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn state_round_trips_through_disk() {
+        let dir = tmp_dir("rt");
+        let s = sample();
+        s.save(&dir).unwrap();
+        let back = ReviewState::load(&dir).unwrap();
+        assert_eq!(back.branch, "feature");
+        assert_eq!(back.files.len(), 1);
+        assert_eq!(back.files[0].hunks.len(), 3);
+        assert_eq!(back.files[0].hunks[1].comment.as_deref(), Some("why"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn progress_counts_reviewed() {
+        assert_eq!(sample().progress(), (2, 3));
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_left_behind() {
+        let dir = tmp_dir("atomic");
+        sample().save(&dir).unwrap();
+        assert!(ReviewState::path_for(&dir).exists());
+        assert!(!ReviewState::path_for(&dir).with_extension("tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replies_are_per_file_and_survive_many_appends() {
+        let dir = tmp_dir("replies");
+        for i in 0..50 {
+            Replies::append(
+                &dir,
+                Reply {
+                    file: "src/a.rs".into(),
+                    hunk_header: "@@ -9 +9 @@".into(),
+                    text: format!("reply {i}"),
+                },
+            )
+            .unwrap();
+        }
+        let all = Replies::load(&dir);
+        assert_eq!(all.replies.len(), 50, "no replies lost");
+        let thread = all.for_hunk("src/a.rs", "@@ -9 +9 @@");
+        assert_eq!(thread.len(), 50);
+        // Different hunk → empty.
+        assert!(all.for_hunk("src/a.rs", "@@ -1 +1 @@").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_missing_is_empty_not_error() {
+        let dir = tmp_dir("missing");
+        assert_eq!(Replies::load(&dir).replies.len(), 0);
+        assert!(ReviewState::load(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
