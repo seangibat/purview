@@ -136,6 +136,7 @@ struct App {
     view: ViewMode,
     tree: FileTree,
     error: Option<String>,
+    report_note: String,
     hl: Highlighter,
     /// Cached, highlighted, render-ready rows for the current selection/view.
     cache: Vec<RenderRow>,
@@ -159,6 +160,7 @@ impl App {
             view: ViewMode::Diff,
             tree: FileTree::new(tree_root),
             error: None,
+            report_note: String::new(),
             hl: Highlighter::new(),
             cache: Vec::new(),
             cache_key: None,
@@ -300,6 +302,90 @@ impl App {
         })
     }
 
+    /// Build a markdown review report — the artifact to hand to Claude.
+    /// Summarizes counts, then lists rejected and unreviewed hunks (the
+    /// things that need attention) per file.
+    fn review_report(&self) -> String {
+        let (rev, tot) = self.review_totals();
+        let approved = self.count_status(ReviewStatus::Approved);
+        let rejected = self.count_status(ReviewStatus::Rejected);
+        let mut s = String::new();
+        s.push_str(&format!("# Review report — {}\n\n", self.branch));
+        let range = match self.source {
+            DiffSource::WorkingTree => "working tree vs HEAD".to_string(),
+            DiffSource::BranchRange => format!("{}...HEAD", self.base),
+        };
+        s.push_str(&format!("Range: {range}\n\n"));
+        s.push_str(&format!(
+            "Progress: {rev}/{tot} hunks reviewed — {approved} approved, {rejected} rejected, {} unreviewed.\n\n",
+            tot.saturating_sub(rev)
+        ));
+
+        let mut wrote_rejected = false;
+        for f in &self.files {
+            let rej: Vec<&Hunk> = f
+                .hunks
+                .iter()
+                .filter(|h| h.status == ReviewStatus::Rejected)
+                .collect();
+            if rej.is_empty() {
+                continue;
+            }
+            if !wrote_rejected {
+                s.push_str("## Rejected hunks (need changes)\n\n");
+                wrote_rejected = true;
+            }
+            s.push_str(&format!("### {}\n\n", f.path));
+            for h in rej {
+                s.push_str(&format!("- `{}`\n", h.header.trim()));
+            }
+            s.push('\n');
+        }
+
+        let mut wrote_unrev = false;
+        for f in &self.files {
+            let un: Vec<&Hunk> = f
+                .hunks
+                .iter()
+                .filter(|h| h.status == ReviewStatus::Unreviewed)
+                .collect();
+            if un.is_empty() {
+                continue;
+            }
+            if !wrote_unrev {
+                s.push_str("## Still unreviewed\n\n");
+                wrote_unrev = true;
+            }
+            s.push_str(&format!("### {}\n\n", f.path));
+            for h in un {
+                s.push_str(&format!("- `{}`\n", h.header.trim()));
+            }
+            s.push('\n');
+        }
+
+        if !wrote_rejected && !wrote_unrev {
+            s.push_str("All hunks approved. ✓\n");
+        }
+        s
+    }
+
+    fn count_status(&self, status: ReviewStatus) -> usize {
+        self.files
+            .iter()
+            .flat_map(|f| f.hunks.iter())
+            .filter(|h| h.status == status)
+            .count()
+    }
+
+    /// Write the report to <repo>/.purview/review-report.md; return its path.
+    fn write_report(&self) -> std::io::Result<PathBuf> {
+        let dir = self.tree.root.join(".purview");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("review-report.md");
+        std::fs::write(&path, self.review_report())?;
+        Ok(path)
+    }
+
     /// Read the full working-tree file for the selected path.
     fn read_full_file(&self, rel: &str) -> std::io::Result<String> {
         let repo_root = Repository::discover(&self.repo_path)
@@ -393,6 +479,20 @@ impl eframe::App for App {
                     }
                     ui.selectable_value(&mut self.view, ViewMode::FullFile, "Full File");
                     ui.selectable_value(&mut self.view, ViewMode::Diff, "Diff");
+                    ui.separator();
+                    if ui.button("report").clicked() {
+                        match self.write_report() {
+                            Ok(p) => {
+                                ui.ctx().copy_text(self.review_report());
+                                self.report_note =
+                                    format!("report → {} (also copied)", p.display());
+                            }
+                            Err(e) => self.report_note = format!("report failed: {e}"),
+                        }
+                    }
+                    if !self.report_note.is_empty() {
+                        ui.label(egui::RichText::new(&self.report_note).small().weak());
+                    }
                 });
             });
             ui.horizontal(|ui| {
