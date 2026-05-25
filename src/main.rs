@@ -1,14 +1,21 @@
 //! purview — codebase-first code review.
 //!
-//! v0: open a git repo, list changed files (working tree vs HEAD) in the
-//! left panel, render the selected file's diff with +/- coloring in the
-//! right. Proves the core loop; the "codebase-first, diff-as-overlay"
-//! model and LSP/agent panes come later.
+//! v0.2: working-tree-vs-HEAD diff with a left changed-files list and a
+//! right content pane that toggles between Diff and Full File views, both
+//! syntax-highlighted (syntect). Rows are virtualized so the monorepo's
+//! giant files stay snappy. Header shows the repo + current branch.
+//!
+//! Still ahead: branch-range base selection, nested file tree, per-chunk
+//! approve/deny review state, comments, symbol jump, the Claude agent pane.
 
 use std::path::PathBuf;
 
 use eframe::egui;
+use egui::Color32;
 use git2::{Diff, DiffFormat, DiffOptions, Repository};
+
+mod highlight;
+use highlight::Highlighter;
 
 fn main() -> eframe::Result<()> {
     let repo_path = std::env::args()
@@ -18,7 +25,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size([1280.0, 840.0])
             .with_title("purview"),
         ..Default::default()
     };
@@ -30,47 +37,74 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// One changed file plus its rendered diff lines.
-struct ChangedFile {
-    path: String,
-    lines: Vec<DiffLine>,
+#[derive(Clone, Copy, PartialEq)]
+enum LineKind {
+    Add,
+    Del,
+    Ctx,
+    Hunk,
 }
 
+/// A diff line: its kind plus the raw text (highlighting applied at render
+/// time from the cached per-file highlight, keyed by line content).
 #[derive(Clone)]
-enum DiffLine {
-    Add(String),
-    Del(String),
-    Ctx(String),
-    Hunk(String),
+struct DiffLineRow {
+    kind: LineKind,
+    text: String,
+}
+
+struct ChangedFile {
+    path: String,
+    diff_rows: Vec<DiffLineRow>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    Diff,
+    FullFile,
 }
 
 struct App {
     repo_path: PathBuf,
+    branch: String,
     files: Vec<ChangedFile>,
     selected: Option<usize>,
+    view: ViewMode,
     error: Option<String>,
+    hl: Highlighter,
+    /// Cached highlighted spans for the currently-shown content, one entry
+    /// per visual row: (kind-or-None, Vec<(color, text)>).
+    cache: Vec<(Option<LineKind>, Vec<(Color32, String)>)>,
+    cache_key: Option<(usize, ViewMode)>,
 }
 
 impl App {
     fn new(repo_path: PathBuf) -> Self {
         let mut app = App {
             repo_path,
+            branch: String::new(),
             files: Vec::new(),
             selected: None,
+            view: ViewMode::Diff,
             error: None,
+            hl: Highlighter::new(),
+            cache: Vec::new(),
+            cache_key: None,
         };
         app.reload();
         app
     }
 
-    /// Recompute the working-tree-vs-HEAD diff.
     fn reload(&mut self) {
         self.files.clear();
         self.selected = None;
         self.error = None;
+        self.cache.clear();
+        self.cache_key = None;
 
         match self.compute_diff() {
-            Ok(files) => {
+            Ok((branch, files)) => {
+                self.branch = branch;
                 self.files = files;
                 if !self.files.is_empty() {
                     self.selected = Some(0);
@@ -80,8 +114,13 @@ impl App {
         }
     }
 
-    fn compute_diff(&self) -> Result<Vec<ChangedFile>, git2::Error> {
+    fn compute_diff(&self) -> Result<(String, Vec<ChangedFile>), git2::Error> {
         let repo = Repository::discover(&self.repo_path)?;
+        let branch = repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(String::from))
+            .unwrap_or_else(|| "(detached)".into());
         let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
 
         let mut opts = DiffOptions::new();
@@ -92,7 +131,6 @@ impl App {
         let diff: Diff =
             repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))?;
 
-        // Collect per-file diff lines by walking the diff print callback.
         use std::cell::RefCell;
         let files: RefCell<Vec<ChangedFile>> = RefCell::new(Vec::new());
 
@@ -108,24 +146,84 @@ impl App {
             if files.last().map(|f| f.path != path).unwrap_or(true) {
                 files.push(ChangedFile {
                     path: path.clone(),
-                    lines: Vec::new(),
+                    diff_rows: Vec::new(),
                 });
             }
             let content = String::from_utf8_lossy(line.content())
                 .trim_end_matches('\n')
                 .to_string();
-            let dl = match line.origin() {
-                '+' => DiffLine::Add(content),
-                '-' => DiffLine::Del(content),
-                'H' => DiffLine::Hunk(content),
-                'F' => return true, // file header — skip; we key on delta path
-                _ => DiffLine::Ctx(content),
+            let kind = match line.origin() {
+                '+' => LineKind::Add,
+                '-' => LineKind::Del,
+                'H' => LineKind::Hunk,
+                'F' => return true,
+                _ => LineKind::Ctx,
             };
-            files.last_mut().unwrap().lines.push(dl);
+            files
+                .last_mut()
+                .unwrap()
+                .diff_rows
+                .push(DiffLineRow { kind, text: content });
             true
         })?;
 
-        Ok(files.into_inner())
+        Ok((branch, files.into_inner()))
+    }
+
+    /// Read the full working-tree file for the selected path.
+    fn read_full_file(&self, rel: &str) -> std::io::Result<String> {
+        let repo_root = Repository::discover(&self.repo_path)
+            .ok()
+            .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
+            .unwrap_or_else(|| self.repo_path.clone());
+        std::fs::read_to_string(repo_root.join(rel))
+    }
+
+    /// Rebuild the highlighted render cache if the selection / view changed.
+    fn ensure_cache(&mut self) {
+        let Some(idx) = self.selected else {
+            self.cache.clear();
+            self.cache_key = None;
+            return;
+        };
+        let key = (idx, self.view);
+        if self.cache_key == Some(key) {
+            return;
+        }
+
+        let path = self.files[idx].path.clone();
+        let mut out: Vec<(Option<LineKind>, Vec<(Color32, String)>)> = Vec::new();
+
+        match self.view {
+            ViewMode::Diff => {
+                let rows = self.files[idx].diff_rows.clone();
+                for r in rows {
+                    if r.kind == LineKind::Hunk {
+                        out.push((
+                            Some(LineKind::Hunk),
+                            vec![(Color32::from_rgb(120, 160, 220), r.text)],
+                        ));
+                    } else {
+                        let spans = self.hl.highlight_line(&path, &r.text);
+                        out.push((Some(r.kind), spans));
+                    }
+                }
+            }
+            ViewMode::FullFile => match self.read_full_file(&path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        let spans = self.hl.highlight_line(&path, line);
+                        out.push((None, spans));
+                    }
+                }
+                Err(e) => {
+                    out.push((None, vec![(Color32::LIGHT_RED, format!("cannot read file: {e}"))]));
+                }
+            },
+        }
+
+        self.cache = out;
+        self.cache_key = Some(key);
     }
 }
 
@@ -134,21 +232,30 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("purview");
-                ui.label(self.repo_path.to_string_lossy());
-                if ui.button("⟳ reload").clicked() {
-                    self.reload();
-                }
-                ui.label(format!("{} changed", self.files.len()));
+                ui.separator();
+                ui.label(format!("repo: {}", self.repo_path.to_string_lossy()));
+                ui.separator();
+                ui.label(format!("branch: {}", self.branch));
+                ui.separator();
+                ui.label("session: (none)");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⟳").clicked() {
+                        self.reload();
+                    }
+                    ui.selectable_value(&mut self.view, ViewMode::FullFile, "Full File");
+                    ui.selectable_value(&mut self.view, ViewMode::Diff, "Diff");
+                });
             });
         });
 
         egui::SidePanel::left("files")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(300.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("Changed ({})", self.files.len())).strong());
                 if let Some(err) = &self.error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    ui.colored_label(Color32::LIGHT_RED, err);
                     return;
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -162,40 +269,60 @@ impl eframe::App for App {
                 });
             });
 
+        self.ensure_cache();
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(idx) = self.selected else {
+            if self.selected.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label("no changes — working tree matches HEAD")
                 });
                 return;
-            };
-            let file = &self.files[idx];
-            egui::ScrollArea::both()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mono = egui::TextStyle::Monospace;
-                    for line in &file.lines {
-                        let (text, color) = match line {
-                            DiffLine::Add(s) => {
-                                (format!("+ {s}"), egui::Color32::from_rgb(120, 200, 120))
-                            }
-                            DiffLine::Del(s) => {
-                                (format!("- {s}"), egui::Color32::from_rgb(220, 120, 120))
-                            }
-                            DiffLine::Hunk(s) => {
-                                (s.clone(), egui::Color32::from_rgb(120, 160, 220))
-                            }
-                            DiffLine::Ctx(s) => {
-                                (format!("  {s}"), egui::Color32::GRAY)
-                            }
+            }
+
+            let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+            let total = self.cache.len();
+            egui::ScrollArea::both().auto_shrink([false, false]).show_rows(
+                ui,
+                row_h,
+                total,
+                |ui, range| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for i in range {
+                        let (kind, spans) = &self.cache[i];
+                        let bg = match kind {
+                            Some(LineKind::Add) => Some(Color32::from_rgb(22, 50, 22)),
+                            Some(LineKind::Del) => Some(Color32::from_rgb(55, 22, 22)),
+                            _ => None,
                         };
-                        ui.label(
-                            egui::RichText::new(text)
-                                .text_style(mono.clone())
-                                .color(color),
-                        );
+                        let gutter = match kind {
+                            Some(LineKind::Add) => "+ ",
+                            Some(LineKind::Del) => "- ",
+                            Some(LineKind::Hunk) => "",
+                            _ => "  ",
+                        };
+                        let draw = |ui: &mut egui::Ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if !gutter.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(gutter)
+                                            .monospace()
+                                            .color(Color32::DARK_GRAY),
+                                    );
+                                }
+                                for (color, text) in spans {
+                                    ui.label(egui::RichText::new(text).monospace().color(*color));
+                                }
+                            });
+                        };
+                        if let Some(bg) = bg {
+                            egui::Frame::none().fill(bg).show(ui, draw);
+                        } else {
+                            draw(ui);
+                        }
                     }
-                });
+                },
+            );
         });
     }
 }
