@@ -15,7 +15,7 @@ use egui::Color32;
 use git2::Repository;
 
 use purview::diff::{self, ChangedFile, DiffSource, Hunk, LineKind, ReviewStatus};
-use purview::highlight::Highlighter;
+use purview::highlight::{Highlighter, IncrementalHl};
 use purview::review_state::{FileState, HunkState, Replies, ReviewState};
 use purview::tree::{FileTree, Node};
 
@@ -94,6 +94,11 @@ struct App {
     /// not yet highlighted. Interior mutability so the render closure (which
     /// borrows `&self`) can fill in newly-visible rows. egui is single-thread.
     hl_cache: std::cell::RefCell<Vec<Option<Vec<(Color32, String)>>>>,
+    /// Incremental highlighter for the full-file view: carries parser state
+    /// across lines so block comments etc. color correctly, while only
+    /// advancing as far as the user has scrolled. None for diff view (its
+    /// rows aren't contiguous source — per-line highlighting is correct).
+    incr: std::cell::RefCell<Option<IncrementalHl>>,
 }
 
 impl App {
@@ -121,6 +126,7 @@ impl App {
             cache_key: None,
             cache_path: String::new(),
             hl_cache: std::cell::RefCell::new(Vec::new()),
+            incr: std::cell::RefCell::new(None),
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -374,24 +380,57 @@ impl App {
         }
 
         let n = out.len();
+        let full_file = effective_view == ViewMode::FullFile;
         self.cache = out;
         self.cache_path = path;
         self.cache_key = Some(key);
         *self.hl_cache.borrow_mut() = vec![None; n];
+        // Full-file view highlights incrementally-but-statefully; diff view
+        // highlights each (non-contiguous) row independently.
+        *self.incr.borrow_mut() = if full_file {
+            Some(self.hl.new_incremental(&self.cache_path))
+        } else {
+            None
+        };
     }
 
     /// Highlighted spans for cache row `i`, computed once and memoized.
+    /// Diff rows are highlighted per-line (they're not contiguous source).
+    /// Full-file rows are highlighted via the incremental stateful path,
+    /// advancing from the last-highlighted line up to `i` so cross-line
+    /// constructs color correctly — and never past what's been viewed.
     fn row_spans(&self, i: usize) -> Vec<(Color32, String)> {
         if let Some(spans) = &self.hl_cache.borrow()[i] {
             return spans.clone();
         }
-        let text = match &self.cache[i] {
-            RenderRow::DiffLine { text, .. } | RenderRow::Plain { text } => text.as_str(),
-            RenderRow::HunkHeader { .. } => "",
-        };
-        let spans = self.hl.highlight_line(&self.cache_path, text);
-        self.hl_cache.borrow_mut()[i] = Some(spans.clone());
-        spans
+        match &self.cache[i] {
+            RenderRow::HunkHeader { .. } => Vec::new(),
+            RenderRow::DiffLine { text, .. } => {
+                let spans = self.hl.highlight_line(&self.cache_path, text);
+                self.hl_cache.borrow_mut()[i] = Some(spans.clone());
+                spans
+            }
+            RenderRow::Plain { .. } => self.highlight_full_file_upto(i),
+        }
+    }
+
+    /// Advance the incremental highlighter through rows [next..=i], caching
+    /// each, then return row `i`'s spans.
+    fn highlight_full_file_upto(&self, i: usize) -> Vec<(Color32, String)> {
+        let mut incr = self.incr.borrow_mut();
+        let st = incr.get_or_insert_with(|| self.hl.new_incremental(&self.cache_path));
+        let mut hl = self.hl_cache.borrow_mut();
+        while st.next <= i {
+            let n = st.next;
+            let text = match &self.cache[n] {
+                RenderRow::Plain { text } => text.as_str(),
+                _ => "",
+            };
+            let spans = self.hl.highlight_incremental(st, text);
+            hl[n] = Some(spans);
+            st.next += 1;
+        }
+        hl[i].clone().unwrap_or_default()
     }
 }
 
