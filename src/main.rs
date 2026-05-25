@@ -763,10 +763,9 @@ mod ui_tests {
         dir
     }
 
-    /// Run one egui frame against `app.ui`. Real widget tree, headless. A
-    /// click-driven harness (egui_kittest) requires egui ≥ 0.30; we're on
-    /// 0.29, so this verifies the UI builds without panicking across states
-    /// rather than simulating pointer clicks.
+    /// Run one egui frame against `app.ui` with a bare Context — verifies the
+    /// UI builds without panicking. The click-simulating test below uses the
+    /// egui_kittest harness for actual pointer interaction.
     fn frame(ctx: &egui::Context, app: &mut App) {
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     }
@@ -802,6 +801,37 @@ mod ui_tests {
         assert!(
             state.files.iter().flat_map(|f| &f.hunks).any(|h| h.status == "approved"),
             "approved status should round-trip to disk"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn clicking_approve_button_flips_status_and_persists() {
+        use egui_kittest::kittest::Queryable; // get_by_label lives here
+        let repo = fixture_repo();
+        let app = App::new(repo.clone());
+        // Harness carries the App as state; the closure renders it each frame.
+        let mut harness = egui_kittest::Harness::new_state(
+            |ctx, app: &mut App| app.ui(ctx),
+            app,
+        );
+        harness.run();
+        // The "approve" button is labelled by its text.
+        harness.get_by_label("approve").click();
+        harness.run();
+
+        let approved = harness
+            .state()
+            .files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .any(|h| h.status == ReviewStatus::Approved);
+        assert!(approved, "clicking approve should set a hunk Approved");
+
+        let state = ReviewState::load(&repo).expect("review-state.json written");
+        assert!(
+            state.files.iter().flat_map(|f| &f.hunks).any(|h| h.status == "approved"),
+            "the click should have persisted approved status to disk"
         );
         let _ = std::fs::remove_dir_all(&repo);
     }
