@@ -1,0 +1,16 @@
+[package]
+name = "purview"
+version = "0.1.0"
+edition = "2021"
+description = "Codebase-first code review — the diff is an overlay on the repo, not the unit of work."
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+# default-features off drops the https/ssh transport (and its openssl-sys
+# + pkg-config build deps). We only diff local repos — no network transport.
+git2 = { version = "0.19", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
