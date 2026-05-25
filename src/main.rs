@@ -15,7 +15,9 @@ use egui::Color32;
 use git2::{Diff, DiffFormat, DiffOptions, Repository};
 
 mod highlight;
+mod tree;
 use highlight::Highlighter;
+use tree::{FileTree, Node};
 
 fn main() -> eframe::Result<()> {
     let repo_path = std::env::args()
@@ -64,6 +66,14 @@ enum ViewMode {
     FullFile,
 }
 
+/// Current selection: either a changed file (diff-able) or an arbitrary
+/// repo file opened from the tree (full-file only).
+#[derive(Clone, PartialEq)]
+enum Selection {
+    Changed(usize),
+    Path(String),
+}
+
 /// What we diff against.
 #[derive(Clone, Copy, PartialEq)]
 enum DiffSource {
@@ -81,18 +91,23 @@ struct App {
     base_input: String,
     source: DiffSource,
     files: Vec<ChangedFile>,
-    selected: Option<usize>,
+    selected: Option<Selection>,
     view: ViewMode,
+    tree: FileTree,
     error: Option<String>,
     hl: Highlighter,
     /// Cached highlighted spans for the currently-shown content, one entry
     /// per visual row: (kind-or-None, Vec<(color, text)>).
     cache: Vec<(Option<LineKind>, Vec<(Color32, String)>)>,
-    cache_key: Option<(usize, ViewMode)>,
+    cache_key: Option<(Selection, ViewMode)>,
 }
 
 impl App {
     fn new(repo_path: PathBuf) -> Self {
+        let tree_root = Repository::discover(&repo_path)
+            .ok()
+            .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
+            .unwrap_or_else(|| repo_path.clone());
         let mut app = App {
             repo_path,
             branch: String::new(),
@@ -102,6 +117,7 @@ impl App {
             files: Vec::new(),
             selected: None,
             view: ViewMode::Diff,
+            tree: FileTree::new(tree_root),
             error: None,
             hl: Highlighter::new(),
             cache: Vec::new(),
@@ -139,7 +155,7 @@ impl App {
                 self.branch = branch;
                 self.files = files;
                 if !self.files.is_empty() {
-                    self.selected = Some(0);
+                    self.selected = Some(Selection::Changed(0));
                 }
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -226,22 +242,27 @@ impl App {
 
     /// Rebuild the highlighted render cache if the selection / view changed.
     fn ensure_cache(&mut self) {
-        let Some(idx) = self.selected else {
+        let Some(sel) = self.selected.clone() else {
             self.cache.clear();
             self.cache_key = None;
             return;
         };
-        let key = (idx, self.view);
-        if self.cache_key == Some(key) {
+        // A tree-opened path can only be shown full-file; force it.
+        let effective_view = match sel {
+            Selection::Path(_) => ViewMode::FullFile,
+            Selection::Changed(_) => self.view,
+        };
+        let key = (sel.clone(), effective_view);
+        if self.cache_key == Some(key.clone()) {
             return;
         }
 
-        let path = self.files[idx].path.clone();
         let mut out: Vec<(Option<LineKind>, Vec<(Color32, String)>)> = Vec::new();
 
-        match self.view {
-            ViewMode::Diff => {
-                let rows = self.files[idx].diff_rows.clone();
+        match (&sel, effective_view) {
+            (Selection::Changed(idx), ViewMode::Diff) => {
+                let path = self.files[*idx].path.clone();
+                let rows = self.files[*idx].diff_rows.clone();
                 for r in rows {
                     if r.kind == LineKind::Hunk {
                         out.push((
@@ -254,17 +275,26 @@ impl App {
                     }
                 }
             }
-            ViewMode::FullFile => match self.read_full_file(&path) {
-                Ok(content) => {
-                    for line in content.lines() {
-                        let spans = self.hl.highlight_line(&path, line);
-                        out.push((None, spans));
+            (sel, ViewMode::FullFile) => {
+                let path = match sel {
+                    Selection::Changed(idx) => self.files[*idx].path.clone(),
+                    Selection::Path(p) => p.clone(),
+                };
+                match self.read_full_file(&path) {
+                    Ok(content) => {
+                        for line in content.lines() {
+                            let spans = self.hl.highlight_line(&path, line);
+                            out.push((None, spans));
+                        }
                     }
+                    Err(e) => out.push((
+                        None,
+                        vec![(Color32::LIGHT_RED, format!("cannot read file: {e}"))],
+                    )),
                 }
-                Err(e) => {
-                    out.push((None, vec![(Color32::LIGHT_RED, format!("cannot read file: {e}"))]));
-                }
-            },
+            }
+            // (Path, Diff) is impossible — forced to FullFile above.
+            _ => {}
         }
 
         self.cache = out;
@@ -324,23 +354,45 @@ impl eframe::App for App {
 
         egui::SidePanel::left("files")
             .resizable(true)
-            .default_width(300.0)
+            .default_width(320.0)
             .show(ctx, |ui| {
+                // Top: changed-files list.
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(format!("Changed ({})", self.files.len())).strong());
                 if let Some(err) = &self.error {
                     ui.colored_label(Color32::LIGHT_RED, err);
-                    return;
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for i in 0..self.files.len() {
-                        let selected = self.selected == Some(i);
-                        let label = self.files[i].path.clone();
-                        if ui.selectable_label(selected, label).clicked() {
-                            self.selected = Some(i);
+                let changed_h = (ui.available_height() * 0.45).max(80.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("changed")
+                    .max_height(changed_h)
+                    .show(ui, |ui| {
+                        for i in 0..self.files.len() {
+                            let selected = self.selected == Some(Selection::Changed(i));
+                            let label = self.files[i].path.clone();
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.selected = Some(Selection::Changed(i));
+                            }
                         }
-                    }
-                });
+                    });
+
+                ui.separator();
+
+                // Bottom: full repo file tree (lazy). Click any file to open
+                // it full-file, changed or not.
+                ui.label(egui::RichText::new("Files").strong());
+                egui::ScrollArea::vertical()
+                    .id_salt("tree")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let root = self.tree.root.clone();
+                        let mut clicked: Option<String> = None;
+                        let cur = self.selected.clone();
+                        render_tree(ui, &root, &mut self.tree.nodes, &cur, &mut clicked);
+                        if let Some(rel) = clicked {
+                            self.selected = Some(Selection::Path(rel));
+                        }
+                    });
             });
 
         self.ensure_cache();
@@ -398,5 +450,38 @@ impl eframe::App for App {
                 },
             );
         });
+    }
+}
+
+/// Recursively render the lazy file tree. Directories expand on click
+/// (loading children on first expand); files are selectable and report
+/// their rel path via `clicked`.
+fn render_tree(
+    ui: &mut egui::Ui,
+    root: &std::path::Path,
+    nodes: &mut [Node],
+    cur: &Option<Selection>,
+    clicked: &mut Option<String>,
+) {
+    for node in nodes.iter_mut() {
+        if node.is_dir {
+            let id = ui.make_persistent_id(&node.rel);
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+                .show_header(ui, |ui| {
+                    ui.label(format!("📁 {}", node.name));
+                })
+                .body(|ui| {
+                    // Lazy-load children on first expansion.
+                    FileTree::load_children(root, node);
+                    if let Some(children) = node.children.as_mut() {
+                        render_tree(ui, root, children, cur, clicked);
+                    }
+                });
+        } else {
+            let selected = matches!(cur, Some(Selection::Path(p)) if *p == node.rel);
+            if ui.selectable_label(selected, &node.name).clicked() {
+                *clicked = Some(node.rel.clone());
+            }
+        }
     }
 }
