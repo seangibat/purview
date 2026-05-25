@@ -13,6 +13,8 @@ git2 = { version = "0.19", default-features = false }
 # Syntax highlighting (Sublime-grade). default-features off avoids the
 # onig C dependency; the fancy-regex pure-Rust engine works fine for us.
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

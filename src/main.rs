@@ -17,6 +17,7 @@ use git2::{Diff, DiffFormat, DiffOptions, Repository};
 mod highlight;
 mod tree;
 use highlight::Highlighter;
+use purview::review_state::{FileState, HunkState, ReviewState};
 use tree::{FileTree, Node};
 
 fn main() -> eframe::Result<()> {
@@ -387,6 +388,41 @@ impl App {
         s
     }
 
+    /// Serialize current review state to <repo>/.purview/review-state.json
+    /// so the MCP server can read it. Called whenever status changes.
+    fn save_review_state(&self) {
+        let range = match self.source {
+            DiffSource::WorkingTree => "working tree vs HEAD".to_string(),
+            DiffSource::BranchRange => format!("{}...HEAD", self.base),
+        };
+        let state = ReviewState {
+            branch: self.branch.clone(),
+            range,
+            files: self
+                .files
+                .iter()
+                .map(|f| FileState {
+                    path: f.path.clone(),
+                    hunks: f
+                        .hunks
+                        .iter()
+                        .map(|h| HunkState {
+                            header: h.header.clone(),
+                            status: match h.status {
+                                ReviewStatus::Approved => "approved",
+                                ReviewStatus::Rejected => "rejected",
+                                ReviewStatus::Unreviewed => "unreviewed",
+                            }
+                            .to_string(),
+                            comment: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        let _ = state.save(&self.tree.root);
+    }
+
     fn count_status(&self, status: ReviewStatus) -> usize {
         self.files
             .iter()
@@ -688,13 +724,15 @@ impl eframe::App for App {
             );
         });
 
-        // Apply review-status changes collected during render.
+        // Apply review-status changes collected during render, then persist
+        // the review state for the MCP server.
         if let (Some(f), false) = (active_file, pending.is_empty()) {
             for (hunk_idx, status) in pending {
                 if let Some(h) = self.files[f].hunks.get_mut(hunk_idx) {
                     h.status = status;
                 }
             }
+            self.save_review_state();
         }
     }
 }

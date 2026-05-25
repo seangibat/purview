@@ -2576,6 +2576,8 @@ dependencies = [
  "eframe",
  "egui",
  "git2",
+ "serde",
+ "serde_json",
  "syntect",
 ]
 
