@@ -53,18 +53,18 @@ enum Selection {
     Path(String),
 }
 
-/// One rendered row in the content pane (post-highlight, ready to draw).
+/// One row in the content pane. Holds RAW text; syntax highlighting is
+/// applied lazily, only for rows actually scrolled into view (see
+/// `hl_cache`). This keeps opening a 50k-line file from stalling — we
+/// highlight ~the visible window, not the whole file.
 enum RenderRow {
     /// A hunk boundary in diff view. Carries the hunk index so the row can
     /// draw approve/deny controls bound to that hunk's live status.
     HunkHeader { hunk_idx: usize, text: String },
-    /// A diff content line (add/del/ctx) with highlighted spans.
-    DiffLine {
-        kind: LineKind,
-        spans: Vec<(Color32, String)>,
-    },
-    /// A full-file content line with highlighted spans.
-    Plain { spans: Vec<(Color32, String)> },
+    /// A diff content line (add/del/ctx), raw text.
+    DiffLine { kind: LineKind, text: String },
+    /// A full-file content line, raw text.
+    Plain { text: String },
 }
 
 struct App {
@@ -85,9 +85,15 @@ struct App {
     /// Bumped on every reload so the render cache can't serve content from a
     /// previous `self.files` under a value-equal Selection index.
     generation: u64,
-    /// Cached, highlighted, render-ready rows for the current selection/view.
+    /// Raw render rows for the current selection/view.
     cache: Vec<RenderRow>,
     cache_key: Option<(u64, Selection, ViewMode)>,
+    /// Syntax-highlight path for the cached rows (the selected file's path).
+    cache_path: String,
+    /// Lazy, per-row memoized highlight spans, parallel to `cache`. None =
+    /// not yet highlighted. Interior mutability so the render closure (which
+    /// borrows `&self`) can fill in newly-visible rows. egui is single-thread.
+    hl_cache: std::cell::RefCell<Vec<Option<Vec<(Color32, String)>>>>,
 }
 
 impl App {
@@ -113,6 +119,8 @@ impl App {
             generation: 0,
             cache: Vec::new(),
             cache_key: None,
+            cache_path: String::new(),
+            hl_cache: std::cell::RefCell::new(Vec::new()),
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -304,11 +312,15 @@ impl App {
         std::fs::read_to_string(self.tree.root.join(rel))
     }
 
-    /// Rebuild the highlighted render cache if the selection / view changed.
+    /// Rebuild the (raw, un-highlighted) render cache if selection/view
+    /// changed. Highlighting happens lazily per visible row at draw time —
+    /// this stays O(rows) with no syntect work, so switching to a giant file
+    /// is instant.
     fn ensure_cache(&mut self) {
         let Some(sel) = self.selected.clone() else {
             self.cache.clear();
             self.cache_key = None;
+            self.hl_cache.borrow_mut().clear();
             return;
         };
         // A tree-opened path can only be shown full-file; force it.
@@ -322,40 +334,38 @@ impl App {
         }
 
         let mut out: Vec<RenderRow> = Vec::new();
+        let mut path = String::new();
 
         match (&sel, effective_view) {
             (Selection::Changed(idx), ViewMode::Diff) => {
-                // Disjoint-field borrow: &self.hl and &self.files[idx] don't
-                // overlap, so no clone of the hunk rows is needed.
-                let hl = &self.hl;
                 let file = &self.files[*idx];
-                let path = file.path.as_str();
+                path = file.path.clone();
                 for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
                     out.push(RenderRow::HunkHeader {
                         hunk_idx,
                         text: hunk.header.clone(),
                     });
                     for r in &hunk.rows {
-                        let spans = hl.highlight_line(path, &r.text);
-                        out.push(RenderRow::DiffLine { kind: r.kind, spans });
+                        out.push(RenderRow::DiffLine {
+                            kind: r.kind,
+                            text: r.text.clone(),
+                        });
                     }
                 }
             }
             (sel, ViewMode::FullFile) => {
-                let path = match sel {
+                path = match sel {
                     Selection::Changed(idx) => self.files[*idx].path.clone(),
                     Selection::Path(p) => p.clone(),
                 };
                 match self.read_full_file(&path) {
                     Ok(content) => {
-                        // Stateful single-pass highlight (correct block
-                        // comments, parser setup paid once).
-                        for spans in self.hl.highlight_file(&path, content.lines()) {
-                            out.push(RenderRow::Plain { spans });
+                        for line in content.lines() {
+                            out.push(RenderRow::Plain { text: line.to_string() });
                         }
                     }
                     Err(e) => out.push(RenderRow::Plain {
-                        spans: vec![(Color32::LIGHT_RED, format!("cannot read file: {e}"))],
+                        text: format!("cannot read file: {e}"),
                     }),
                 }
             }
@@ -363,8 +373,25 @@ impl App {
             _ => {}
         }
 
+        let n = out.len();
         self.cache = out;
+        self.cache_path = path;
         self.cache_key = Some(key);
+        *self.hl_cache.borrow_mut() = vec![None; n];
+    }
+
+    /// Highlighted spans for cache row `i`, computed once and memoized.
+    fn row_spans(&self, i: usize) -> Vec<(Color32, String)> {
+        if let Some(spans) = &self.hl_cache.borrow()[i] {
+            return spans.clone();
+        }
+        let text = match &self.cache[i] {
+            RenderRow::DiffLine { text, .. } | RenderRow::Plain { text } => text.as_str(),
+            RenderRow::HunkHeader { .. } => "",
+        };
+        let spans = self.hl.highlight_line(&self.cache_path, text);
+        self.hl_cache.borrow_mut()[i] = Some(spans.clone());
+        spans
     }
 }
 
@@ -644,7 +671,7 @@ impl App {
                                         });
                                     });
                             }
-                            RenderRow::DiffLine { kind, spans } => {
+                            RenderRow::DiffLine { kind, .. } => {
                                 let (bg, gutter) = match kind {
                                     LineKind::Add => {
                                         (Some(Color32::from_rgb(22, 50, 22)), "+ ")
@@ -654,15 +681,17 @@ impl App {
                                     }
                                     _ => (None, "  "),
                                 };
-                                let draw = |ui: &mut egui::Ui| line_row(ui, gutter, spans);
+                                let spans = self.row_spans(i); // lazy, memoized
+                                let draw = |ui: &mut egui::Ui| line_row(ui, gutter, &spans);
                                 if let Some(bg) = bg {
                                     egui::Frame::none().fill(bg).show(ui, draw);
                                 } else {
                                     draw(ui);
                                 }
                             }
-                            RenderRow::Plain { spans } => {
-                                line_row(ui, "", spans);
+                            RenderRow::Plain { .. } => {
+                                let spans = self.row_spans(i); // lazy, memoized
+                                line_row(ui, "", &spans);
                             }
                         }
                     }

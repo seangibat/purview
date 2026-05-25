@@ -30,6 +30,9 @@ fn bench_highlight(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("highlight_file");
     g.sample_size(20);
+    // Full-file highlight cost. The GUI NO LONGER pays this at open time
+    // (highlighting is lazy/per-visible-row now) — kept as a regression
+    // guard + to document the cost we avoid.
     g.bench_function("5k_lines", |b| {
         b.iter(|| {
             let out = hl.highlight_file("x.rs", src_5k.lines());
@@ -43,6 +46,17 @@ fn bench_highlight(c: &mut Criterion) {
         })
     });
     g.finish();
+
+    // What opening a file ACTUALLY costs now: highlight just the visible
+    // window (~50 rows), regardless of total file size.
+    let window: Vec<&str> = src_50k.lines().take(50).collect();
+    c.bench_function("highlight_visible_window_50", |b| {
+        b.iter(|| {
+            for line in &window {
+                std::hint::black_box(hl.highlight_line("x.rs", line).len());
+            }
+        })
+    });
 }
 
 fn bench_replies_load(c: &mut Criterion) {
