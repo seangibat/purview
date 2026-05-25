@@ -204,6 +204,13 @@ impl App {
             s.push_str(&format!("### {}\n\n", f.path));
             for h in rej {
                 s.push_str(&format!("- `{}`\n", h.header.trim()));
+                // Carry the reviewer's comment so a pasted report has the
+                // "why", not just which hunk — parity with the MCP path.
+                if !h.comment.trim().is_empty() {
+                    for line in h.comment.trim().lines() {
+                        s.push_str(&format!("  - {line}\n"));
+                    }
+                }
             }
             s.push('\n');
         }
@@ -363,6 +370,15 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl App {
+    /// All rendering for one frame. Split out of `eframe::App::update` (which
+    /// only forwards here) so tests can drive a frame with a bare
+    /// `egui::Context`, no `eframe::Frame` required.
+    fn ui(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("purview");
@@ -713,5 +729,80 @@ fn render_tree(
                 *clicked = Some(node.rel.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A throwaway git repo with one committed file and a working-tree edit,
+    /// so the App opens with a diff containing at least one hunk.
+    fn fixture_repo() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "purview-ui-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git").args(args).current_dir(&dir).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["checkout", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        dir
+    }
+
+    /// Run one egui frame against `app.ui`. Real widget tree, headless. A
+    /// click-driven harness (egui_kittest) requires egui ≥ 0.30; we're on
+    /// 0.29, so this verifies the UI builds without panicking across states
+    /// rather than simulating pointer clicks.
+    fn frame(ctx: &egui::Context, app: &mut App) {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+    }
+
+    #[test]
+    fn app_opens_with_a_diff_and_renders_all_states_without_panic() {
+        let repo = fixture_repo();
+        let mut app = App::new(repo.clone());
+        assert!(app.selected.is_some(), "a changed file should be auto-selected");
+        assert!(!app.files.is_empty(), "the working-tree edit should produce a diff");
+
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app); // Diff view
+        app.view = ViewMode::FullFile;
+        frame(&ctx, &mut app); // Full-file view
+        app.view = ViewMode::Diff;
+        // Open a comment editor + render again.
+        app.active_hunk = Some(0);
+        frame(&ctx, &mut app);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn approving_a_hunk_persists_review_state() {
+        // The click handler just sets this status; verify the persistence the
+        // GUI then performs round-trips to disk.
+        let repo = fixture_repo();
+        let mut app = App::new(repo.clone());
+        app.files[0].hunks[0].status = ReviewStatus::Approved;
+        app.save_review_state();
+
+        let state = ReviewState::load(&repo).expect("review-state.json written");
+        assert!(
+            state.files.iter().flat_map(|f| &f.hunks).any(|h| h.status == "approved"),
+            "approved status should round-trip to disk"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
