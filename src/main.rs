@@ -138,9 +138,12 @@ struct App {
     error: Option<String>,
     report_note: String,
     hl: Highlighter,
+    /// Bumped on every reload so the render cache can't serve content from a
+    /// previous `self.files` under a value-equal Selection index.
+    generation: u64,
     /// Cached, highlighted, render-ready rows for the current selection/view.
     cache: Vec<RenderRow>,
-    cache_key: Option<(Selection, ViewMode)>,
+    cache_key: Option<(u64, Selection, ViewMode)>,
 }
 
 impl App {
@@ -162,6 +165,7 @@ impl App {
             error: None,
             report_note: String::new(),
             hl: Highlighter::new(),
+            generation: 0,
             cache: Vec::new(),
             cache_key: None,
         };
@@ -189,8 +193,10 @@ impl App {
         self.files.clear();
         self.selected = None;
         self.error = None;
+        self.report_note.clear();
         self.cache.clear();
         self.cache_key = None;
+        self.generation = self.generation.wrapping_add(1);
 
         match self.compute_diff() {
             Ok((branch, files)) => {
@@ -234,8 +240,9 @@ impl App {
             }
         };
 
-        use std::cell::RefCell;
-        let files: RefCell<Vec<ChangedFile>> = RefCell::new(Vec::new());
+        // diff.print's callback is FnMut, so a plain captured &mut Vec works
+        // — no RefCell needed.
+        let mut files: Vec<ChangedFile> = Vec::new();
 
         diff.print(DiffFormat::Patch, |delta, _hunk, line| {
             let path = delta
@@ -245,22 +252,30 @@ impl App {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "<unknown>".into());
 
-            let mut files = files.borrow_mut();
             if files.last().map(|f| f.path != path).unwrap_or(true) {
                 files.push(ChangedFile {
                     path: path.clone(),
                     hunks: Vec::new(),
                 });
             }
-            let content = String::from_utf8_lossy(line.content())
-                .trim_end_matches('\n')
-                .to_string();
 
             let file = files.last_mut().unwrap();
             match line.origin() {
                 'F' => {} // file header — skip; we key on delta path
+                'B' => {
+                    // Binary delta — no reviewable text. Single placeholder hunk.
+                    if file.hunks.is_empty() {
+                        file.hunks.push(Hunk {
+                            header: "(binary file)".to_string(),
+                            rows: Vec::new(),
+                            status: ReviewStatus::Unreviewed,
+                        });
+                    }
+                }
                 'H' => {
-                    // Hunk header — start a fresh hunk.
+                    let content = String::from_utf8_lossy(line.content())
+                        .trim_end_matches('\n')
+                        .to_string();
                     file.hunks.push(Hunk {
                         header: content,
                         rows: Vec::new(),
@@ -268,6 +283,9 @@ impl App {
                     });
                 }
                 origin => {
+                    let content = String::from_utf8_lossy(line.content())
+                        .trim_end_matches('\n')
+                        .to_string();
                     let kind = match origin {
                         '+' => LineKind::Add,
                         '-' => LineKind::Del,
@@ -291,7 +309,7 @@ impl App {
             true
         })?;
 
-        Ok((branch, files.into_inner()))
+        Ok((branch, files))
     }
 
     /// (reviewed, total) hunks across all changed files.
@@ -386,13 +404,10 @@ impl App {
         Ok(path)
     }
 
-    /// Read the full working-tree file for the selected path.
+    /// Read the full working-tree file for the selected path. The repo
+    /// workdir is already known (tree.root) — no need to re-discover.
     fn read_full_file(&self, rel: &str) -> std::io::Result<String> {
-        let repo_root = Repository::discover(&self.repo_path)
-            .ok()
-            .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
-            .unwrap_or_else(|| self.repo_path.clone());
-        std::fs::read_to_string(repo_root.join(rel))
+        std::fs::read_to_string(self.tree.root.join(rel))
     }
 
     /// Rebuild the highlighted render cache if the selection / view changed.
@@ -407,8 +422,8 @@ impl App {
             Selection::Path(_) => ViewMode::FullFile,
             Selection::Changed(_) => self.view,
         };
-        let key = (sel.clone(), effective_view);
-        if self.cache_key == Some(key.clone()) {
+        let key = (self.generation, sel.clone(), effective_view);
+        if self.cache_key.as_ref() == Some(&key) {
             return;
         }
 
@@ -416,19 +431,18 @@ impl App {
 
         match (&sel, effective_view) {
             (Selection::Changed(idx), ViewMode::Diff) => {
-                let path = self.files[*idx].path.clone();
-                // Clone the lightweight structure we need so we can borrow
-                // self.hl immutably while iterating.
-                let hunks: Vec<(usize, String, Vec<DiffLineRow>)> = self.files[*idx]
-                    .hunks
-                    .iter()
-                    .enumerate()
-                    .map(|(hi, h)| (hi, h.header.clone(), h.rows.clone()))
-                    .collect();
-                for (hunk_idx, header, rows) in hunks {
-                    out.push(RenderRow::HunkHeader { hunk_idx, text: header });
-                    for r in rows {
-                        let spans = self.hl.highlight_line(&path, &r.text);
+                // Disjoint-field borrow: &self.hl and &self.files[idx] don't
+                // overlap, so no clone of the hunk rows is needed.
+                let hl = &self.hl;
+                let file = &self.files[*idx];
+                let path = file.path.as_str();
+                for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                    out.push(RenderRow::HunkHeader {
+                        hunk_idx,
+                        text: hunk.header.clone(),
+                    });
+                    for r in &hunk.rows {
+                        let spans = hl.highlight_line(path, &r.text);
                         out.push(RenderRow::DiffLine { kind: r.kind, spans });
                     }
                 }
@@ -440,8 +454,9 @@ impl App {
                 };
                 match self.read_full_file(&path) {
                     Ok(content) => {
-                        for line in content.lines() {
-                            let spans = self.hl.highlight_line(&path, line);
+                        // Stateful single-pass highlight (correct block
+                        // comments, parser setup paid once).
+                        for spans in self.hl.highlight_file(&path, content.lines()) {
                             out.push(RenderRow::Plain { spans });
                         }
                     }

@@ -1,16 +1,11 @@
 //! Syntect-backed syntax highlighting → egui colors.
-//!
-//! We highlight a line at a time (the diff is line-oriented and we render
-//! line-by-line). True syntect highlighting is stateful across lines, but
-//! per-line is a fine approximation for a v0.2 review surface and keeps the
-//! cache model trivial. Upgrade to stateful per-file highlighting when the
-//! full-file view needs multi-line constructs (block comments, etc.) to
-//! color correctly.
 
 use egui::Color32;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
+
+pub type Spans = Vec<(Color32, String)>;
 
 pub struct Highlighter {
     syntaxes: SyntaxSet,
@@ -35,9 +30,31 @@ impl Highlighter {
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
     }
 
-    /// Highlight one line into (color, text) spans. On any error, return the
-    /// whole line in a neutral gray so rendering never panics.
-    pub fn highlight_line(&self, path: &str, line: &str) -> Vec<(Color32, String)> {
+    /// Highlight a whole file's lines in one **stateful** pass: a single
+    /// `HighlightLines` carries parser state across lines, so block comments
+    /// and multi-line strings color correctly — and we pay the parser setup
+    /// cost once per file, not once per line. Returns one span-vec per line.
+    pub fn highlight_file<'a>(
+        &self,
+        path: &str,
+        lines: impl Iterator<Item = &'a str>,
+    ) -> Vec<Spans> {
+        let syntax = self.syntax_for(path);
+        let mut h = HighlightLines::new(syntax, &self.theme);
+        lines
+            .map(|line| match h.highlight_line(line, &self.syntaxes) {
+                Ok(ranges) => ranges
+                    .into_iter()
+                    .map(|(style, text)| (to_color(style), text.to_string()))
+                    .collect(),
+                Err(_) => vec![(Color32::GRAY, line.to_string())],
+            })
+            .collect()
+    }
+
+    /// Highlight a single isolated line (diff rows aren't a contiguous file,
+    /// so each is highlighted independently). On error, neutral gray.
+    pub fn highlight_line(&self, path: &str, line: &str) -> Spans {
         let syntax = self.syntax_for(path);
         let mut h = HighlightLines::new(syntax, &self.theme);
         match h.highlight_line(line, &self.syntaxes) {
