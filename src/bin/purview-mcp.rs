@@ -168,6 +168,21 @@ fn call_tool(
             if file.is_empty() || hunk_header.is_empty() || text.is_empty() {
                 return tool_error(id, "reply_to_comment requires file, hunk_header, text");
             }
+            // Validate the target hunk exists, so a reply can't vanish into a
+            // path/header that never renders.
+            let exists = ReviewState::load(repo_root)
+                .map(|s| {
+                    s.files.iter().any(|f| {
+                        f.path == file && f.hunks.iter().any(|h| h.header == hunk_header)
+                    })
+                })
+                .unwrap_or(false);
+            if !exists {
+                return tool_error(
+                    id,
+                    &format!("no hunk matches file={file:?} hunk_header={hunk_header:?} — check get_review_state"),
+                );
+            }
             match Replies::append(
                 repo_root,
                 Reply {

@@ -648,6 +648,14 @@ impl eframe::App for App {
         let mut pending: Vec<(usize, ReviewStatus)> = Vec::new();
         // Hunk whose comment button was clicked this frame (opens the editor).
         let mut open_comment: Option<usize> = None;
+        // Agent replies, loaded once per frame (tiny dir). Used for both the
+        // per-hunk indicator and the open thread. Poll while a changed file is
+        // shown so a reply posted by the agent surfaces without interaction.
+        let replies = Replies::load(&self.tree.root);
+        if active_file.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        }
+        let active_path = active_file.map(|f| self.files[f].path.clone());
 
         // Bottom panel: comment editor for the active hunk. Rendered before
         // the central panel's scroll so it claims its space; the &mut borrow
@@ -674,11 +682,8 @@ impl eframe::App for App {
                         );
                         changed = resp.changed();
                     }
-                    // Agent replies on this hunk's thread (written by the MCP
-                    // server to replies.json). Poll ~1/s while the panel's open
-                    // so a reply posted by the agent shows up without a click.
-                    ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-                    let replies = Replies::load(&self.tree.root);
+                    // Agent replies on this hunk's thread (loaded once per
+                    // frame at top level; see `replies`).
                     let thread = replies.for_hunk(&file_path, &header);
                     if !thread.is_empty() {
                         ui.separator();
@@ -758,6 +763,19 @@ impl eframe::App for App {
                                             let cbtn = if has_comment { "💬*" } else { "💬" };
                                             if ui.small_button(cbtn).clicked() {
                                                 open_comment = Some(*hunk_idx);
+                                            }
+                                            // Agent-reply count for this hunk.
+                                            if let Some(p) = &active_path {
+                                                let n = replies.for_hunk(p, text).len();
+                                                if n > 0 {
+                                                    ui.label(
+                                                        egui::RichText::new(format!("↩{n}"))
+                                                            .small()
+                                                            .color(Color32::from_rgb(
+                                                                120, 200, 160,
+                                                            )),
+                                                    );
+                                                }
                                             }
                                             ui.label(
                                                 egui::RichText::new(text)

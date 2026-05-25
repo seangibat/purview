@@ -6,6 +6,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Write `contents` to `path` atomically: write a sibling temp file, then
+/// rename over the target. Rename is atomic on the same filesystem, so a
+/// concurrent reader sees either the old file or the new one — never a
+/// half-written one.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ReviewState {
     pub branch: String,
@@ -40,32 +50,61 @@ pub struct Reply {
     pub text: String,
 }
 
-/// Append-only log of agent replies. Read by the GUI to render threads.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+/// Agent replies, stored as one file per reply under `.purview/replies/`.
+///
+/// One-file-per-reply (rather than a single appended array) makes concurrent
+/// posting inherently safe: there's no read-modify-write, so two MCP
+/// processes (e.g. Claude restarting / multiple clients on one repo) can't
+/// lose each other's replies, and each file write can't corrupt another.
+/// Files are named `<millis>-<counter>.json` so directory order is post order.
+#[derive(Clone, Debug, Default)]
 pub struct Replies {
     pub replies: Vec<Reply>,
 }
 
 impl Replies {
-    pub fn path_for(repo_root: &Path) -> PathBuf {
-        repo_root.join(".purview").join("replies.json")
+    pub fn dir_for(repo_root: &Path) -> PathBuf {
+        repo_root.join(".purview").join("replies")
     }
 
+    /// Load all reply files (sorted by filename = post order). Malformed
+    /// individual files are skipped, not fatal.
     pub fn load(repo_root: &Path) -> Self {
-        std::fs::read_to_string(Self::path_for(repo_root))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let dir = Self::dir_for(repo_root);
+        let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+                .collect(),
+            Err(_) => return Self::default(),
+        };
+        entries.sort();
+        let replies = entries
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .filter_map(|s| serde_json::from_str::<Reply>(&s).ok())
+            .collect();
+        Replies { replies }
     }
 
     pub fn append(repo_root: &Path, reply: Reply) -> std::io::Result<()> {
-        let dir = repo_root.join(".purview");
+        let dir = Self::dir_for(repo_root);
         std::fs::create_dir_all(&dir)?;
-        let mut all = Self::load(repo_root);
-        all.replies.push(reply);
-        let json = serde_json::to_string_pretty(&all)
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        // Add the process id + a nanosecond tail to avoid same-millis collisions
+        // between distinct posts/processes.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let name = format!("{millis}-{}-{nanos}.json", std::process::id());
+        let json = serde_json::to_string_pretty(&reply)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(Self::path_for(repo_root), json)
+        atomic_write(&dir.join(name), &json)
     }
 
     /// Replies matching a given file + hunk header, in order.
@@ -88,7 +127,8 @@ impl ReviewState {
         std::fs::create_dir_all(&dir)?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(Self::path_for(repo_root), json)
+        // Atomic: the MCP server may be reading this file concurrently.
+        atomic_write(&Self::path_for(repo_root), &json)
     }
 
     pub fn load(repo_root: &Path) -> std::io::Result<Self> {
