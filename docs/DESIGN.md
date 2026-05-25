@@ -92,13 +92,56 @@ chunk) where it's actually differentiated — not for mechanical lookup.
 - **v0.2** (in progress): syntect syntax highlighting, Diff/Full-File
   toggle, branch in header, virtualized rows (monorepo perf).
 
+## Agent integration (decided 2026-05-25)
+
+**purview is an MCP server; the Claude session is the client.** Not the
+reverse.
+
+purview exposes the review as MCP tools/resources: `list_comments`,
+`get_thread`, `get_diff(file)`, `get_full_file(path)`, `get_review_state`,
+`reply_to_comment(id, text)`. A Claude running in a terminal attaches to
+purview's server (`claude mcp add purview …`) and can read the review and
+post replies that appear inline in purview's threads.
+
+Key consequence: **the dev does NOT move their session into purview.**
+They keep the existing terminal Claude — the one that already has the repo
+loaded and authored the PR — and bridge it to the review. The author-agent
+becomes the question-answerer, with full prior context. Human reviews in
+purview; agent responds in purview; agent never leaves the terminal.
+
+Comment flow: human comments on a hunk → purview exposes it as a pending
+comment → connected Claude sees it (poll `pending_comments` first; MCP
+server→client push later) → replies → reply lands in the purview thread.
+
+"Cloud features gated on a session" = the session IS the MCP connection.
+Header shows `session: (none)` until a Claude attaches, then
+`session: claude@<id>`; agent features inert until then.
+
+Also offer an embedded "spawn reviewer" button (Claude via SDK) for users
+without a terminal session. MCP-server-first; embedded spawn secondary.
+
+## Deferred (need visual iteration on a real display)
+
+- `show_rows` assumes uniform row height, but hunk-header rows (with
+  approve/reject buttons) are taller → potential overlap/clip. Fix needs
+  either uniform LayoutJob rows + controls relocated, or variable-height
+  virtualization. Verify visually.
+- Replace per-span `ui.label` with one `LayoutJob` galley per row to cut
+  per-frame widget churn.
+- True lazy per-visible-row highlighting (highlight only the `show_rows`
+  range, memoized) — currently the whole file is highlighted once on
+  selection (stateful, fast, but still O(file) up front).
+
 ## Roadmap (rough next order)
 
-1. Branch-range base selection (`main...HEAD`) — what you actually review.
-2. Nested file tree (bottom-left), full repo structure.
-3. Jump change-section → change-section (next/prev hunk keys).
-4. Per-chunk approve/deny review state + "what's left" overview.
-5. LSP integration (go-to-def, find-refs).
-6. Claude agent pane (session-gated): comments → live Claude responses,
-   blast-radius queries, duplicate detection, comprehension-mode grading.
-7. Inline editing.
+1. ✅ Branch-range base selection (`main...HEAD`).
+2. ✅ Nested file tree (bottom-left), full repo structure.
+3. ✅ Per-hunk approve/deny review state + "what's left" overview.
+4. ✅ Review report export.
+5. MCP server (read-only review state first: list_comments/get_diff, then
+   reply_to_comment). The agent-integration backbone above.
+6. Per-hunk comments (so rejects carry the *why*; feeds the report + MCP).
+7. Jump change-section → change-section (next/prev hunk keys).
+8. LSP integration (go-to-def, find-refs).
+9. Claude agent pane / embedded spawn; comprehension-mode grading.
+10. Inline editing.
