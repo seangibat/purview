@@ -17,7 +17,7 @@ use git2::Repository;
 use purview::diff::{self, ChangedFile, DiffSource, Hunk, LineKind, ReviewStatus};
 use purview::highlight::{Highlighter, IncrementalHl, Spans};
 use purview::review_state::{FileState, HunkState, Replies, ReviewState};
-use purview::tree::{FileTree, Node};
+use purview::tree::{self, FileTree, Node};
 
 fn main() -> eframe::Result<()> {
     let repo_path = std::env::args()
@@ -37,6 +37,18 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |_cc| Ok(Box::new(App::new(repo_path)))),
     )
+}
+
+/// Ctrl+P fuzzy file-open overlay.
+struct QuickOpen {
+    query: String,
+    /// All repo file paths (collected once when the overlay opens).
+    all: Vec<String>,
+    truncated: bool,
+    /// Currently highlighted match index (into the filtered list).
+    sel: usize,
+    /// True for the first frame so we can focus the text field.
+    just_opened: bool,
 }
 
 /// How the diff is laid out.
@@ -99,6 +111,8 @@ struct App {
     layout: Layout,
     extent: Extent,
     tree: FileTree,
+    /// Ctrl+P fuzzy file-open overlay state. Some = open.
+    quick_open: Option<QuickOpen>,
     error: Option<String>,
     report_note: String,
     hl: Highlighter,
@@ -141,6 +155,7 @@ impl App {
             layout: Layout::Inline,
             extent: Extent::Summary,
             tree: FileTree::new(tree_root),
+            quick_open: None,
             error: None,
             report_note: String::new(),
             hl: Highlighter::new(),
@@ -524,7 +539,115 @@ impl App {
     /// All rendering for one frame. Split out of `eframe::App::update` (which
     /// only forwards here) so tests can drive a frame with a bare
     /// `egui::Context`, no `eframe::Frame` required.
+    /// Render the Ctrl+P fuzzy file-open overlay if active. Esc closes;
+    /// ↑/↓ move the selection; Enter opens the highlighted file (full-file
+    /// view via Selection::Path).
+    fn quick_open_overlay(&mut self, ctx: &egui::Context) {
+        let Some(qo) = self.quick_open.as_mut() else { return };
+
+        // Keyboard: Esc / Enter / Up / Down (read before the text field eats them).
+        let (esc, enter, up, down) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+            )
+        });
+        if esc {
+            self.quick_open = None;
+            return;
+        }
+
+        // Filter + rank: fuzzy score asc, then shorter path as tiebreak.
+        let mut scored: Vec<(i64, &String)> = qo
+            .all
+            .iter()
+            .filter_map(|p| tree::fuzzy_score(&qo.query, p).map(|s| (s, p)))
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.len().cmp(&b.1.len())));
+        let matches: Vec<&String> = scored.iter().take(200).map(|(_, p)| *p).collect();
+
+        if down {
+            qo.sel = (qo.sel + 1).min(matches.len().saturating_sub(1));
+        }
+        if up {
+            qo.sel = qo.sel.saturating_sub(1);
+        }
+        if qo.sel >= matches.len() {
+            qo.sel = matches.len().saturating_sub(1);
+        }
+
+        let mut open_path: Option<String> = None;
+        if enter {
+            if let Some(p) = matches.get(qo.sel) {
+                open_path = Some((*p).clone());
+            }
+        }
+
+        egui::Window::new("Open file")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
+            .fixed_size([640.0, 420.0])
+            .show(ctx, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut qo.query)
+                        .hint_text("fuzzy file search…")
+                        .desired_width(f32::INFINITY),
+                );
+                if qo.just_opened {
+                    resp.request_focus();
+                    qo.just_opened = false;
+                } else {
+                    // Keep focus so typing always lands here.
+                    resp.request_focus();
+                }
+                if qo.truncated {
+                    ui.label(
+                        egui::RichText::new("(file list truncated at 50k)")
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for (i, p) in matches.iter().enumerate() {
+                        let selected = i == qo.sel;
+                        if ui.selectable_label(selected, *p).clicked() {
+                            open_path = Some((*p).clone());
+                        }
+                    }
+                });
+            });
+
+        if let Some(p) = open_path {
+            self.selected = Some(Selection::Path(p));
+            self.quick_open = None;
+        }
+    }
+
     fn ui(&mut self, ctx: &egui::Context) {
+        // Ctrl+P opens the fuzzy file finder. (Cmd+P on mac.)
+        let toggle_qo = ctx.input(|i| {
+            i.key_pressed(egui::Key::P) && (i.modifiers.ctrl || i.modifiers.command)
+        });
+        if toggle_qo {
+            if self.quick_open.is_some() {
+                self.quick_open = None;
+            } else {
+                let (all, truncated) = tree::collect_files(&self.tree.root, 50_000);
+                self.quick_open = Some(QuickOpen {
+                    query: String::new(),
+                    all,
+                    truncated,
+                    sel: 0,
+                    just_opened: true,
+                });
+            }
+        }
+        self.quick_open_overlay(ctx);
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("purview");

@@ -45,6 +45,76 @@ impl FileTree {
     }
 }
 
+/// Recursively collect every (gitignore-respecting, non-.git) file path in
+/// the repo, relative + forward-slashed. Used to populate the Ctrl+P fuzzy
+/// finder. Bounded by `cap` so a pathological monorepo can't hang the UI;
+/// returns (paths, truncated).
+pub fn collect_files(root: &Path, cap: usize) -> (Vec<String>, bool) {
+    let repo = Repository::open(root).ok();
+    let mut out = Vec::new();
+    let mut stack = vec![String::new()];
+    let mut truncated = false;
+    while let Some(rel) = stack.pop() {
+        if out.len() >= cap {
+            truncated = true;
+            break;
+        }
+        let abs = if rel.is_empty() { root.to_path_buf() } else { root.join(&rel) };
+        let Ok(entries) = std::fs::read_dir(&abs) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" {
+                continue;
+            }
+            let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            if let Some(repo) = &repo {
+                if repo.is_path_ignored(Path::new(&child_rel)).unwrap_or(false) {
+                    continue;
+                }
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(child_rel);
+            } else {
+                out.push(child_rel);
+            }
+        }
+    }
+    out.sort();
+    (out, truncated)
+}
+
+/// Subsequence fuzzy match: does `query`'s chars appear in order within
+/// `text` (case-insensitive)? Returns a score (lower = better: prefers
+/// earlier + more contiguous matches) or None if no match. Empty query
+/// matches everything with score 0.
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let mut qi = 0;
+    let mut score: i64 = 0;
+    let mut last_match: Option<usize> = None;
+    for (ti, &c) in t.iter().enumerate() {
+        if qi < q.len() && c == q[qi] {
+            // Penalize gaps between consecutive matched chars + distance from start.
+            if let Some(prev) = last_match {
+                score += (ti - prev) as i64;
+            } else {
+                score += ti as i64; // distance of first match from start
+            }
+            last_match = Some(ti);
+            qi += 1;
+        }
+    }
+    if qi == q.len() {
+        Some(score)
+    } else {
+        None
+    }
+}
+
 /// List immediate children of `rel` (relative dir path, "" = root),
 /// gitignore-aware, dirs first then files, both alphabetical.
 fn read_children(root: &Path, rel: &str) -> Vec<Node> {
@@ -97,4 +167,19 @@ fn read_children(root: &Path, rel: &str) -> Vec<Node> {
     dirs.sort_by(|a, b| a.name.cmp(&b.name));
     files.sort_by(|a, b| a.name.cmp(&b.name));
     dirs.into_iter().chain(files).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuzzy_score;
+    #[test]
+    fn fuzzy_basics() {
+        assert!(fuzzy_score("", "anything").is_some());
+        assert!(fuzzy_score("mainrs", "src/main.rs").is_some());
+        assert!(fuzzy_score("xyz", "src/main.rs").is_none());
+        // closer/contiguous match scores lower (better)
+        let a = fuzzy_score("main", "main.rs").unwrap();
+        let b = fuzzy_score("main", "zzz/m_a_i_n.rs").unwrap();
+        assert!(a < b);
+    }
 }
