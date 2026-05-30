@@ -161,6 +161,10 @@ struct App {
     /// Set when a key-nav action wants the content scroll area moved to a
     /// specific vertical offset on the next frame.
     pending_scroll: Option<f32>,
+    /// Inline edit in full-file view: (cache row index = file line, buffer).
+    /// Double-click a line (or `i` on a focused line) to start; Enter writes
+    /// the edited line back to the file on disk, Esc cancels.
+    editing: Option<(usize, String)>,
 }
 
 impl App {
@@ -198,6 +202,7 @@ impl App {
             focus_hunk: 0,
             hunk_rows: Vec::new(),
             pending_scroll: None,
+            editing: None,
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -387,6 +392,21 @@ impl App {
     /// workdir is already known (tree.root) — no need to re-discover.
     fn read_full_file(&self, rel: &str) -> std::io::Result<String> {
         std::fs::read_to_string(self.tree.root.join(rel))
+    }
+
+    /// Write `new_text` to the file's line `line0` (0-based), preserving the
+    /// rest. Only valid in full-file (Plain) view, where cache row == file
+    /// line. Returns Ok on success.
+    fn write_line(&self, rel: &str, line0: usize, new_text: &str) -> std::io::Result<()> {
+        let path = self.tree.root.join(rel);
+        let content = std::fs::read_to_string(&path)?;
+        let out = replace_nth_line(&content, line0, new_text).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "line out of range")
+        })?;
+        // Atomic: temp + rename, so a concurrent reader never sees half.
+        let tmp = path.with_extension("purview-tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &path)
     }
 
     /// Rebuild the (raw, un-highlighted) render cache if selection/view
@@ -1039,6 +1059,13 @@ impl App {
         // Identifier clicked in the diff this frame (becomes the F12 target).
         let mut clicked_symbol: Option<String> = None;
         let sel_sym = self.selected_symbol.clone();
+        // Inline-edit state, pulled out so the render closure can mutate the
+        // buffer while `self` is immutably borrowed for the cache.
+        let edit_row = self.editing.as_ref().map(|(r, _)| *r);
+        let mut edit_buf = self.editing.as_ref().map(|(_, b)| b.clone()).unwrap_or_default();
+        let mut edit_start: Option<(usize, String)> = None;
+        let mut edit_commit: Option<(usize, String)> = None;
+        let mut edit_cancel = false;
         // Agent replies, loaded once per frame (tiny dir). Used for both the
         // per-hunk indicator and the open thread. Poll while a changed file is
         // shown so a reply posted by the agent surfaces without interaction.
@@ -1215,19 +1242,43 @@ impl App {
                                 let clk = if let Some(bg) = bg {
                                     egui::Frame::none()
                                         .fill(bg)
-                                        .show(ui, |ui| line_row(ui, gutter, &spans, sel))
+                                        .show(ui, |ui| line_row(ui, gutter, &spans, sel, true))
                                         .inner
                                 } else {
-                                    line_row(ui, gutter, &spans, sel)
+                                    line_row(ui, gutter, &spans, sel, true)
                                 };
                                 if clk.is_some() {
                                     clicked_symbol = clk;
                                 }
                             }
-                            RenderRow::Plain { .. } => {
-                                let spans = self.row_spans(i); // lazy, memoized
-                                if let Some(s) = line_row(ui, "", &spans, sel_sym.as_deref()) {
-                                    clicked_symbol = Some(s);
+                            RenderRow::Plain { text } => {
+                                if edit_row == Some(i) {
+                                    // This line is being edited: inline TextEdit.
+                                    let te = ui.add(
+                                        egui::TextEdit::singleline(&mut edit_buf)
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                    te.request_focus();
+                                    let enter = te.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    if enter {
+                                        edit_commit = Some((i, edit_buf.clone()));
+                                    } else if esc {
+                                        edit_cancel = true;
+                                    }
+                                } else {
+                                    let spans = self.row_spans(i); // lazy, memoized
+                                    // Not clickable-for-symbols in file view; the
+                                    // row-level response catches double-click to edit.
+                                    let resp = ui
+                                        .scope(|ui| line_row(ui, "", &spans, None, false))
+                                        .response
+                                        .interact(egui::Sense::click());
+                                    if resp.double_clicked() {
+                                        edit_start = Some((i, text.clone()));
+                                    }
                                 }
                             }
                             RenderRow::SplitLine { left, right } => {
@@ -1265,6 +1316,28 @@ impl App {
         }
         if let Some(s) = clicked_symbol {
             self.selected_symbol = Some(s);
+        }
+        // Resolve inline-edit transitions.
+        if let Some((row, text)) = edit_start {
+            self.editing = Some((row, text));
+        } else if edit_cancel {
+            self.editing = None;
+        } else if let Some((row, new_text)) = edit_commit {
+            // Write the line back; row index == file line in Plain view, which
+            // only happens for a tree-opened Path selection.
+            if let Some(Selection::Path(path)) = self.selected.clone() {
+                match self.write_line(&path, row, &new_text) {
+                    Ok(()) => {
+                        self.report_note = format!("edited {path}:{}", row + 1);
+                        self.cache_key = None; // force re-read of the file
+                    }
+                    Err(e) => self.report_note = format!("edit failed: {e}"),
+                }
+            }
+            self.editing = None;
+        } else {
+            // Still editing the same row — keep the buffer.
+            self.editing = edit_row.map(|r| (r, edit_buf));
         }
     }
 }
@@ -1324,16 +1397,32 @@ fn split_cell(
     if let Some(bg) = bg {
         egui::Frame::none()
             .fill(bg)
-            .show(ui, |ui| line_row(ui, gutter, spans, selected))
+            .show(ui, |ui| line_row(ui, gutter, spans, selected, true))
             .inner
     } else {
-        line_row(ui, gutter, spans, selected)
+        line_row(ui, gutter, spans, selected, true)
     }
 }
 
 /// Is `c` part of a code identifier?
 fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Replace 0-based line `n` of `content` with `new`, preserving the file's
+/// trailing-newline state. None if `n` is out of range.
+fn replace_nth_line(content: &str, n: usize, new: &str) -> Option<String> {
+    let had_trailing_nl = content.ends_with('\n');
+    let mut lines: Vec<&str> = content.lines().collect();
+    if n >= lines.len() {
+        return None;
+    }
+    lines[n] = new;
+    let mut out = lines.join("\n");
+    if had_trailing_nl {
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// Draw a monospace content line: gutter + highlighted spans, with
@@ -1345,6 +1434,7 @@ fn line_row(
     gutter: &str,
     spans: &[(Color32, String)],
     selected: Option<&str>,
+    clickable: bool,
 ) -> Option<String> {
     let mut clicked: Option<String> = None;
     ui.horizontal(|ui| {
@@ -1354,7 +1444,8 @@ fn line_row(
         }
         for (color, text) in spans {
             // Split the span into identifier / non-identifier runs; make
-            // identifiers clickable so a click selects the symbol.
+            // identifiers clickable (when `clickable`) so a click selects the
+            // symbol for go-to-definition.
             let mut buf = String::new();
             let mut buf_ident = false;
             let flush = |ui: &mut egui::Ui, s: &str, ident: bool, clicked: &mut Option<String>| {
@@ -1365,7 +1456,7 @@ fn line_row(
                 if ident && selected == Some(s) {
                     rt = rt.underline().background_color(Color32::from_rgb(60, 60, 30));
                 }
-                if ident {
+                if ident && clickable {
                     let resp = ui.add(egui::Label::new(rt).sense(egui::Sense::click()));
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1537,6 +1628,21 @@ mod ui_tests {
 
     fn row(kind: LineKind, t: &str) -> diff::DiffLineRow {
         diff::DiffLineRow { kind, text: t.into() }
+    }
+
+    #[test]
+    fn replace_nth_line_preserves_trailing_newline() {
+        assert_eq!(
+            super::replace_nth_line("a\nb\nc\n", 1, "B"),
+            Some("a\nB\nc\n".to_string())
+        );
+        // no trailing newline preserved
+        assert_eq!(
+            super::replace_nth_line("a\nb\nc", 2, "C"),
+            Some("a\nb\nC".to_string())
+        );
+        // out of range
+        assert_eq!(super::replace_nth_line("a\nb\n", 5, "x"), None);
     }
 
     #[test]
