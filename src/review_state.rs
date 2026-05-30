@@ -16,6 +16,20 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Create `<repo_root>/.purview/` and ensure it self-ignores via a
+/// `.gitignore` containing `*`, so review state never gets committed into
+/// the repo being reviewed. The user doesn't have to add anything by hand.
+pub fn ensure_purview_dir(repo_root: &Path) -> std::io::Result<PathBuf> {
+    let dir = repo_root.join(".purview");
+    std::fs::create_dir_all(&dir)?;
+    let gi = dir.join(".gitignore");
+    if !gi.exists() {
+        // Ignore everything in .purview/ (including this file).
+        let _ = std::fs::write(&gi, "*\n");
+    }
+    Ok(dir)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ReviewState {
     pub branch: String,
@@ -89,6 +103,7 @@ impl Replies {
     }
 
     pub fn append(repo_root: &Path, reply: Reply) -> std::io::Result<()> {
+        ensure_purview_dir(repo_root)?; // self-ignoring .purview/
         let dir = Self::dir_for(repo_root);
         std::fs::create_dir_all(&dir)?;
         let millis = std::time::SystemTime::now()
@@ -123,8 +138,7 @@ impl ReviewState {
     }
 
     pub fn save(&self, repo_root: &Path) -> std::io::Result<()> {
-        let dir = repo_root.join(".purview");
-        std::fs::create_dir_all(&dir)?;
+        ensure_purview_dir(repo_root)?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // Atomic: the MCP server may be reading this file concurrently.
@@ -192,6 +206,16 @@ mod tests {
     #[test]
     fn progress_counts_reviewed() {
         assert_eq!(sample().progress(), (2, 3));
+    }
+
+    #[test]
+    fn save_creates_self_ignoring_purview_dir() {
+        let dir = tmp_dir("gi");
+        sample().save(&dir).unwrap();
+        let gi = dir.join(".purview").join(".gitignore");
+        assert!(gi.exists(), ".purview/.gitignore should be created");
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "*\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
