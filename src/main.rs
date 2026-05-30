@@ -135,6 +135,14 @@ struct App {
     incr: std::cell::RefCell<Option<IncrementalHl>>,
     /// Lazy memo for split-view rows: (left_spans, right_spans) per cache row.
     split_cache: std::cell::RefCell<Vec<Option<(Spans, Spans)>>>,
+    /// Keyboard-nav focus: which hunk (by hunk index) is "current" for n/p
+    /// navigation and a/r/c actions.
+    focus_hunk: usize,
+    /// Cache-row index of each hunk's header row, so n/p can scroll to it.
+    hunk_rows: Vec<usize>,
+    /// Set when a key-nav action wants the content scroll area moved to a
+    /// specific vertical offset on the next frame.
+    pending_scroll: Option<f32>,
 }
 
 impl App {
@@ -166,6 +174,9 @@ impl App {
             hl_cache: std::cell::RefCell::new(Vec::new()),
             incr: std::cell::RefCell::new(None),
             split_cache: std::cell::RefCell::new(Vec::new()),
+            focus_hunk: 0,
+            hunk_rows: Vec::new(),
+            pending_scroll: None,
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -451,6 +462,16 @@ impl App {
         }
 
         let n = out.len();
+        // Record each hunk header's row index (for n/p scroll-to nav).
+        self.hunk_rows = out
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, RenderRow::HunkHeader { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if self.focus_hunk >= self.hunk_rows.len() {
+            self.focus_hunk = 0;
+        }
         self.cache = out;
         self.cache_path = path;
         self.cache_key = Some(key);
@@ -627,6 +648,75 @@ impl App {
         }
     }
 
+    /// Modal keyboard navigation (Gerrit-style). Suppressed while the
+    /// quick-open overlay is up or a text field has keyboard focus (so
+    /// typing in the comment box / base field isn't hijacked).
+    ///   j / k        next / prev changed file
+    ///   n / p        next / prev hunk (scrolls to it)
+    ///   a / r        approve / reject the focused hunk
+    ///   c            open the comment editor for the focused hunk
+    fn handle_nav_keys(&mut self, ctx: &egui::Context) {
+        if self.quick_open.is_some() || ctx.wants_keyboard_input() {
+            return;
+        }
+        let (j, k, n, p, a, r, c) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::J),
+                i.key_pressed(egui::Key::K),
+                i.key_pressed(egui::Key::N),
+                i.key_pressed(egui::Key::P),
+                i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::R),
+                i.key_pressed(egui::Key::C),
+            )
+        });
+
+        // j/k: move through the changed-files list.
+        let cur_file = match self.selected {
+            Some(Selection::Changed(i)) => Some(i),
+            _ => None,
+        };
+        if (j || k) && !self.files.is_empty() {
+            let i = cur_file.unwrap_or(0);
+            let next = if j {
+                (i + 1).min(self.files.len() - 1)
+            } else {
+                i.saturating_sub(1)
+            };
+            self.selected = Some(Selection::Changed(next));
+            self.focus_hunk = 0;
+        }
+
+        // n/p: move the focused hunk + scroll to it.
+        if (n || p) && !self.hunk_rows.is_empty() {
+            if n {
+                self.focus_hunk = (self.focus_hunk + 1).min(self.hunk_rows.len() - 1);
+            } else {
+                self.focus_hunk = self.focus_hunk.saturating_sub(1);
+            }
+            let row_h = ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0;
+            let row = self.hunk_rows.get(self.focus_hunk).copied().unwrap_or(0);
+            self.pending_scroll = Some(row as f32 * row_h);
+        }
+
+        // a/r/c: act on the focused hunk (only meaningful for a changed file).
+        if let Some(fi) = cur_file {
+            let set = |app: &mut App, status: ReviewStatus| {
+                if let Some(h) = app.files[fi].hunks.get_mut(app.focus_hunk) {
+                    h.status = status;
+                }
+                app.save_review_state();
+            };
+            if a {
+                set(self, ReviewStatus::Approved);
+            } else if r {
+                set(self, ReviewStatus::Rejected);
+            } else if c {
+                self.active_hunk = Some(self.focus_hunk);
+            }
+        }
+    }
+
     fn ui(&mut self, ctx: &egui::Context) {
         // Ctrl+P opens the fuzzy file finder. (Cmd+P on mac.)
         let toggle_qo = ctx.input(|i| {
@@ -647,6 +737,7 @@ impl App {
             }
         }
         self.quick_open_overlay(ctx);
+        self.handle_nav_keys(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -851,23 +942,41 @@ impl App {
 
             let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
             let total = self.cache.len();
-            egui::ScrollArea::both().auto_shrink([false, false]).show_rows(
+            let mut area = egui::ScrollArea::both().auto_shrink([false, false]);
+            // Apply a pending key-nav scroll (n/p jumped to a hunk).
+            if let Some(off) = self.pending_scroll.take() {
+                area = area.vertical_scroll_offset(off);
+            }
+            area.show_rows(
                 ui,
                 row_h,
                 total,
                 |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    let focus_row = self.hunk_rows.get(self.focus_hunk).copied();
                     for i in range {
                         match &self.cache[i] {
                             RenderRow::HunkHeader { hunk_idx, text } => {
+                                let focused = Some(i) == focus_row;
                                 let status = active_file
                                     .and_then(|f| self.files[f].hunks.get(*hunk_idx))
                                     .map(|h| h.status)
                                     .unwrap_or(ReviewStatus::Unreviewed);
+                                let hdr_bg = if focused {
+                                    Color32::from_rgb(48, 58, 80) // focused: brighter
+                                } else {
+                                    Color32::from_rgb(30, 36, 48)
+                                };
                                 egui::Frame::none()
-                                    .fill(Color32::from_rgb(30, 36, 48))
+                                    .fill(hdr_bg)
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
+                                            if focused {
+                                                ui.label(
+                                                    egui::RichText::new("▶")
+                                                        .color(Color32::from_rgb(140, 180, 240)),
+                                                );
+                                            }
                                             let (glyph, col) = match status {
                                                 ReviewStatus::Approved => {
                                                     ("✓", Color32::from_rgb(120, 200, 120))
