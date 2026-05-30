@@ -39,13 +39,22 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// How the diff is laid out.
 #[derive(Clone, Copy, PartialEq)]
-enum ViewMode {
-    /// Unified inline diff (+/- in one column).
-    Diff,
-    /// Side-by-side: old (left) vs new (right), aligned per hunk.
+enum Layout {
+    /// Unified: +/- in one column.
+    Inline,
+    /// Side-by-side: old (left) vs new (right).
     Split,
-    FullFile,
+}
+
+/// How much of the file is shown.
+#[derive(Clone, Copy, PartialEq)]
+enum Extent {
+    /// Just the changed hunks + a few lines of context.
+    Summary,
+    /// The whole file, with the diff overlaid (every unchanged line as context).
+    Full,
 }
 
 /// Current selection: either a changed file (diff-able) or an arbitrary
@@ -87,7 +96,8 @@ struct App {
     selected: Option<Selection>,
     /// Hunk index whose comment editor is open in the bottom panel.
     active_hunk: Option<usize>,
-    view: ViewMode,
+    layout: Layout,
+    extent: Extent,
     tree: FileTree,
     error: Option<String>,
     report_note: String,
@@ -97,7 +107,7 @@ struct App {
     generation: u64,
     /// Raw render rows for the current selection/view.
     cache: Vec<RenderRow>,
-    cache_key: Option<(u64, Selection, ViewMode)>,
+    cache_key: Option<(u64, Selection, Layout, Extent)>,
     /// Syntax-highlight path for the cached rows (the selected file's path).
     cache_path: String,
     /// Lazy, per-row memoized highlight spans, parallel to `cache`. None =
@@ -128,7 +138,8 @@ impl App {
             files: Vec::new(),
             selected: None,
             active_hunk: None,
-            view: ViewMode::Diff,
+            layout: Layout::Inline,
+            extent: Extent::Summary,
             tree: FileTree::new(tree_root),
             error: None,
             report_note: String::new(),
@@ -342,52 +353,75 @@ impl App {
             self.hl_cache.borrow_mut().clear();
             return;
         };
-        // A tree-opened path can only be shown full-file; force it.
-        let effective_view = match sel {
-            Selection::Path(_) => ViewMode::FullFile,
-            Selection::Changed(_) => self.view,
-        };
-        let key = (self.generation, sel.clone(), effective_view);
+        let key = (self.generation, sel.clone(), self.layout, self.extent);
         if self.cache_key.as_ref() == Some(&key) {
             return;
         }
 
         let mut out: Vec<RenderRow> = Vec::new();
-        let mut path = String::new();
+        let path: String;
+        // `plain` = unchanged file opened from the tree (no diff). Highlighted
+        // incrementally-stateful; everything else (a diff) is per-line.
+        let mut plain = false;
 
-        match (&sel, effective_view) {
-            (Selection::Changed(idx), ViewMode::Diff) => {
-                let file = &self.files[*idx];
-                path = file.path.clone();
-                for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-                    out.push(RenderRow::HunkHeader {
-                        hunk_idx,
-                        text: hunk.header.clone(),
-                    });
-                    for r in &hunk.rows {
-                        out.push(RenderRow::DiffLine {
-                            kind: r.kind,
-                            text: r.text.clone(),
+        match &sel {
+            Selection::Changed(idx) => {
+                path = self.files[*idx].path.clone();
+                // Extent::Full re-diffs this one file with full context (the
+                // whole file shown, changes overlaid). Summary uses the
+                // already-computed 3-line-context hunks.
+                let hunks: Vec<diff::Hunk> = if self.extent == Extent::Full {
+                    diff::compute_with(
+                        &self.repo_path,
+                        self.source,
+                        &self.base,
+                        u32::MAX,
+                        Some(&path),
+                    )
+                    .ok()
+                    .and_then(|(_, mut files)| {
+                        files
+                            .iter()
+                            .position(|f| f.path == path)
+                            .map(|i| std::mem::take(&mut files[i].hunks))
+                    })
+                    .unwrap_or_else(|| self.files[*idx].hunks.clone())
+                } else {
+                    self.files[*idx].hunks.clone()
+                };
+
+                for (hunk_idx, hunk) in hunks.iter().enumerate() {
+                    // In Full extent the single hunk spans the file; its header
+                    // is noise, so only show headers in Summary extent.
+                    if self.extent == Extent::Summary {
+                        out.push(RenderRow::HunkHeader {
+                            hunk_idx,
+                            text: hunk.header.clone(),
                         });
+                    } else if hunk_idx == 0 {
+                        // One header carrying the hunk controls for the file.
+                        out.push(RenderRow::HunkHeader {
+                            hunk_idx,
+                            text: String::new(),
+                        });
+                    }
+                    match self.layout {
+                        Layout::Inline => {
+                            for r in &hunk.rows {
+                                out.push(RenderRow::DiffLine {
+                                    kind: r.kind,
+                                    text: r.text.clone(),
+                                });
+                            }
+                        }
+                        Layout::Split => out.extend(split_align(&hunk.rows)),
                     }
                 }
             }
-            (Selection::Changed(idx), ViewMode::Split) => {
-                let file = &self.files[*idx];
-                path = file.path.clone();
-                for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-                    out.push(RenderRow::HunkHeader {
-                        hunk_idx,
-                        text: hunk.header.clone(),
-                    });
-                    out.extend(split_align(&hunk.rows));
-                }
-            }
-            (sel, ViewMode::FullFile) => {
-                path = match sel {
-                    Selection::Changed(idx) => self.files[*idx].path.clone(),
-                    Selection::Path(p) => p.clone(),
-                };
+            Selection::Path(p) => {
+                // Unchanged file from the tree — just show it whole.
+                path = p.clone();
+                plain = true;
                 match self.read_full_file(&path) {
                     Ok(content) => {
                         for line in content.lines() {
@@ -399,20 +433,15 @@ impl App {
                     }),
                 }
             }
-            // (Path, Diff) / (Path, Split) impossible — forced to FullFile above.
-            _ => {}
         }
 
         let n = out.len();
-        let full_file = effective_view == ViewMode::FullFile;
         self.cache = out;
         self.cache_path = path;
         self.cache_key = Some(key);
         *self.hl_cache.borrow_mut() = vec![None; n];
         *self.split_cache.borrow_mut() = vec![None; n];
-        // Full-file view highlights incrementally-but-statefully; diff view
-        // highlights each (non-contiguous) row independently.
-        *self.incr.borrow_mut() = if full_file {
+        *self.incr.borrow_mut() = if plain {
             Some(self.hl.new_incremental(&self.cache_path))
         } else {
             None
@@ -512,9 +541,16 @@ impl App {
                     if ui.button("⟳").clicked() {
                         self.reload();
                     }
-                    ui.selectable_value(&mut self.view, ViewMode::FullFile, "Full File");
-                    ui.selectable_value(&mut self.view, ViewMode::Split, "Split");
-                    ui.selectable_value(&mut self.view, ViewMode::Diff, "Unified");
+                    ui.separator();
+                    // Two orthogonal controls. (right_to_left, so added order
+                    // is the visual reverse.)
+                    ui.selectable_value(&mut self.extent, Extent::Full, "Full");
+                    ui.selectable_value(&mut self.extent, Extent::Summary, "Summary");
+                    ui.label("extent:");
+                    ui.separator();
+                    ui.selectable_value(&mut self.layout, Layout::Split, "Split");
+                    ui.selectable_value(&mut self.layout, Layout::Inline, "Inline");
+                    ui.label("layout:");
                     ui.separator();
                     if ui.button("report").clicked() {
                         match self.write_report() {
@@ -962,13 +998,17 @@ mod ui_tests {
         assert!(!app.files.is_empty(), "the working-tree edit should produce a diff");
 
         let ctx = egui::Context::default();
-        frame(&ctx, &mut app); // Unified diff view
-        app.view = ViewMode::Split;
-        frame(&ctx, &mut app); // Side-by-side view
-        app.view = ViewMode::FullFile;
-        frame(&ctx, &mut app); // Full-file view
-        app.view = ViewMode::Diff;
-        // Open a comment editor + render again.
+        // Render all four layout×extent combinations without panicking.
+        for layout in [Layout::Inline, Layout::Split] {
+            for extent in [Extent::Summary, Extent::Full] {
+                app.layout = layout;
+                app.extent = extent;
+                frame(&ctx, &mut app);
+            }
+        }
+        // Reset + open a comment editor; render again.
+        app.layout = Layout::Inline;
+        app.extent = Extent::Summary;
         app.active_hunk = Some(0);
         frame(&ctx, &mut app);
         let _ = std::fs::remove_dir_all(&repo);

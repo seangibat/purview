@@ -92,6 +92,19 @@ pub fn compute(
     source: DiffSource,
     base: &str,
 ) -> Result<(String, Vec<ChangedFile>), git2::Error> {
+    compute_with(repo_path, source, base, 3, None)
+}
+
+/// Like [`compute`] but with a chosen number of `context_lines` and an
+/// optional single-file `pathspec`. A very large `context_lines` (e.g.
+/// `u32::MAX`) yields the whole file as context — the "Full extent" view.
+pub fn compute_with(
+    repo_path: &Path,
+    source: DiffSource,
+    base: &str,
+    context_lines: u32,
+    pathspec: Option<&str>,
+) -> Result<(String, Vec<ChangedFile>), git2::Error> {
     let repo = Repository::discover(repo_path)?;
     let branch = repo
         .head()
@@ -101,12 +114,15 @@ pub fn compute(
     let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
 
     let mut opts = DiffOptions::new();
-    opts.context_lines(3)
+    opts.context_lines(context_lines)
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         // Without this, untracked files appear in the delta list but emit no
         // patch content — so they'd never produce reviewable hunks.
         .show_untracked_content(true);
+    if let Some(ps) = pathspec {
+        opts.pathspec(ps);
+    }
 
     let diff: Diff = match source {
         DiffSource::WorkingTree => {
