@@ -39,6 +39,18 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// "Go to definition" overlay state (haiku + git grep).
+struct Goto {
+    query: String,
+    just_opened: bool,
+    /// Set while the background resolve thread is running.
+    resolving: bool,
+    /// Receives the resolved definition (or None) from the worker thread.
+    rx: Option<std::sync::mpsc::Receiver<Option<purview::gotodef::Candidate>>>,
+    /// A status/error line shown in the overlay.
+    note: String,
+}
+
 /// Ctrl+P fuzzy file-open overlay.
 struct QuickOpen {
     query: String,
@@ -113,6 +125,12 @@ struct App {
     tree: FileTree,
     /// Ctrl+P fuzzy file-open overlay state. Some = open.
     quick_open: Option<QuickOpen>,
+    /// Go-to-definition overlay state. Some = open.
+    goto: Option<Goto>,
+    /// Identifier the user last clicked in the diff (target for F12).
+    selected_symbol: Option<String>,
+    /// After opening a Path selection, scroll its content to this 1-based line.
+    pending_line: Option<usize>,
     error: Option<String>,
     report_note: String,
     hl: Highlighter,
@@ -164,6 +182,9 @@ impl App {
             extent: Extent::Summary,
             tree: FileTree::new(tree_root),
             quick_open: None,
+            goto: None,
+            selected_symbol: None,
+            pending_line: None,
             error: None,
             report_note: String::new(),
             hl: Highlighter::new(),
@@ -563,6 +584,116 @@ impl App {
     /// Render the Ctrl+P fuzzy file-open overlay if active. Esc closes;
     /// ↑/↓ move the selection; Enter opens the highlighted file (full-file
     /// view via Selection::Path).
+    /// Go-to-definition overlay: type a symbol, Enter kicks off a background
+    /// git-grep + Claude-CLI resolve, jumps to the definition when it lands.
+    /// Kick off a background go-to-definition resolve for `symbol` (git grep
+    /// + Claude CLI). Opens/updates the Goto overlay in its "resolving" state;
+    /// goto_overlay polls the worker and jumps when it lands.
+    fn start_goto(&mut self, symbol: String) {
+        if symbol.trim().is_empty() {
+            return;
+        }
+        let symbol = symbol.trim().to_string();
+        let root = self.tree.root.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_symbol = symbol.clone();
+        std::thread::spawn(move || {
+            let res = purview::gotodef::find_definition(&root, &worker_symbol, None);
+            let _ = tx.send(res);
+        });
+        self.goto = Some(Goto {
+            query: symbol,
+            just_opened: false,
+            resolving: true,
+            rx: Some(rx),
+            note: "resolving via git grep + haiku…".to_string(),
+        });
+    }
+
+    fn goto_overlay(&mut self, ctx: &egui::Context) {
+        // Poll the worker for a finished resolve, regardless of overlay focus.
+        let mut finished: Option<Option<purview::gotodef::Candidate>> = None;
+        if let Some(go) = self.goto.as_mut() {
+            if let Some(rx) = &go.rx {
+                if let Ok(res) = rx.try_recv() {
+                    finished = Some(res);
+                }
+            }
+        }
+        if let Some(res) = finished {
+            match res {
+                Some(cand) => {
+                    self.selected = Some(Selection::Path(cand.file.clone()));
+                    self.pending_line = Some(cand.line);
+                    self.goto = None;
+                }
+                None => {
+                    if let Some(go) = self.goto.as_mut() {
+                        go.resolving = false;
+                        go.rx = None;
+                        go.note = "no definition found".to_string();
+                    }
+                }
+            }
+        }
+
+        if self.goto.is_none() {
+            return;
+        }
+        let (esc, enter) = ctx.input(|i| {
+            (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter))
+        });
+        if esc {
+            self.goto = None;
+            return;
+        }
+        // Snapshot the bits we need without holding a borrow across start_goto.
+        let resolving = self.goto.as_ref().map(|g| g.resolving).unwrap_or(false);
+        let query = self
+            .goto
+            .as_ref()
+            .map(|g| g.query.trim().to_string())
+            .unwrap_or_default();
+        if resolving {
+            // Keep repainting so the try_recv poll runs.
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        if enter && !resolving && !query.is_empty() {
+            self.start_goto(query);
+        }
+        let Some(go) = self.goto.as_mut() else { return };
+
+        egui::Window::new("Go to definition")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
+            .fixed_size([560.0, 120.0])
+            .show(ctx, |ui| {
+                let resp = ui.add_enabled(
+                    !go.resolving,
+                    egui::TextEdit::singleline(&mut go.query)
+                        .hint_text("symbol name (e.g. OrderValidator::check)")
+                        .desired_width(f32::INFINITY),
+                );
+                if go.just_opened {
+                    resp.request_focus();
+                    go.just_opened = false;
+                } else if !go.resolving {
+                    resp.request_focus();
+                }
+                if !go.note.is_empty() {
+                    ui.label(egui::RichText::new(&go.note).small().weak());
+                }
+                if !go.resolving {
+                    ui.label(
+                        egui::RichText::new("Enter to find · Esc to cancel")
+                            .small()
+                            .weak(),
+                    );
+                }
+            });
+    }
+
     fn quick_open_overlay(&mut self, ctx: &egui::Context) {
         let Some(qo) = self.quick_open.as_mut() else { return };
 
@@ -656,10 +787,10 @@ impl App {
     ///   a / r        approve / reject the focused hunk
     ///   c            open the comment editor for the focused hunk
     fn handle_nav_keys(&mut self, ctx: &egui::Context) {
-        if self.quick_open.is_some() || ctx.wants_keyboard_input() {
+        if self.quick_open.is_some() || self.goto.is_some() || ctx.wants_keyboard_input() {
             return;
         }
-        let (j, k, n, p, a, r, c) = ctx.input(|i| {
+        let (j, k, n, p, a, r, c, g) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::J),
                 i.key_pressed(egui::Key::K),
@@ -668,8 +799,30 @@ impl App {
                 i.key_pressed(egui::Key::A),
                 i.key_pressed(egui::Key::R),
                 i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::G),
             )
         });
+
+        // F12: go to definition of the clicked symbol (editor convention).
+        let f12 = ctx.input(|i| i.key_pressed(egui::Key::F12));
+        if f12 {
+            if let Some(sym) = self.selected_symbol.clone() {
+                self.start_goto(sym);
+            }
+            return;
+        }
+
+        // g: open the go-to-definition overlay (type a symbol).
+        if g {
+            self.goto = Some(Goto {
+                query: self.selected_symbol.clone().unwrap_or_default(),
+                just_opened: true,
+                resolving: false,
+                rx: None,
+                note: String::new(),
+            });
+            return;
+        }
 
         // j/k: move through the changed-files list.
         let cur_file = match self.selected {
@@ -737,6 +890,7 @@ impl App {
             }
         }
         self.quick_open_overlay(ctx);
+        self.goto_overlay(ctx);
         self.handle_nav_keys(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -751,6 +905,13 @@ impl App {
                 ui.label(format!("reviewed: {rev}/{tot} hunks"));
                 ui.separator();
                 ui.label("session: (none)");
+                if let Some(sym) = &self.selected_symbol {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("symbol: {sym}  (F12 → def)"))
+                            .color(Color32::from_rgb(200, 200, 120)),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⟳").clicked() {
                         self.reload();
@@ -875,6 +1036,9 @@ impl App {
         let mut pending: Vec<(usize, ReviewStatus)> = Vec::new();
         // Hunk whose comment button was clicked this frame (opens the editor).
         let mut open_comment: Option<usize> = None;
+        // Identifier clicked in the diff this frame (becomes the F12 target).
+        let mut clicked_symbol: Option<String> = None;
+        let sel_sym = self.selected_symbol.clone();
         // Agent replies, loaded once per frame (tiny dir). Used for both the
         // per-hunk indicator and the open thread. Poll while a changed file is
         // shown so a reply posted by the agent surfaces without interaction.
@@ -946,6 +1110,12 @@ impl App {
             // Apply a pending key-nav scroll (n/p jumped to a hunk).
             if let Some(off) = self.pending_scroll.take() {
                 area = area.vertical_scroll_offset(off);
+            }
+            // Go-to-def landed on a Path selection: scroll to the target line
+            // (1-based). Plain rows are 1:1 with file lines, so offset = line.
+            if let Some(line) = self.pending_line.take() {
+                let target = line.saturating_sub(1).saturating_sub(8); // a little headroom
+                area = area.vertical_scroll_offset(target as f32 * row_h);
             }
             area.show_rows(
                 ui,
@@ -1041,24 +1211,37 @@ impl App {
                                     _ => (None, "  "),
                                 };
                                 let spans = self.row_spans(i); // lazy, memoized
-                                let draw = |ui: &mut egui::Ui| line_row(ui, gutter, &spans);
-                                if let Some(bg) = bg {
-                                    egui::Frame::none().fill(bg).show(ui, draw);
+                                let sel = sel_sym.as_deref();
+                                let clk = if let Some(bg) = bg {
+                                    egui::Frame::none()
+                                        .fill(bg)
+                                        .show(ui, |ui| line_row(ui, gutter, &spans, sel))
+                                        .inner
                                 } else {
-                                    draw(ui);
+                                    line_row(ui, gutter, &spans, sel)
+                                };
+                                if clk.is_some() {
+                                    clicked_symbol = clk;
                                 }
                             }
                             RenderRow::Plain { .. } => {
                                 let spans = self.row_spans(i); // lazy, memoized
-                                line_row(ui, "", &spans);
+                                if let Some(s) = line_row(ui, "", &spans, sel_sym.as_deref()) {
+                                    clicked_symbol = Some(s);
+                                }
                             }
                             RenderRow::SplitLine { left, right } => {
                                 let lkind = left.as_ref().map(|(k, _)| *k);
                                 let rkind = right.as_ref().map(|(k, _)| *k);
                                 let (lspans, rspans) = self.split_spans(i);
+                                let sel = sel_sym.as_deref();
                                 ui.columns(2, |cols| {
-                                    split_cell(&mut cols[0], lkind, &lspans);
-                                    split_cell(&mut cols[1], rkind, &rspans);
+                                    if let Some(s) = split_cell(&mut cols[0], lkind, &lspans, sel) {
+                                        clicked_symbol = Some(s);
+                                    }
+                                    if let Some(s) = split_cell(&mut cols[1], rkind, &rspans, sel) {
+                                        clicked_symbol = Some(s);
+                                    }
                                 });
                             }
                         }
@@ -1079,6 +1262,9 @@ impl App {
         }
         if let Some(h) = open_comment {
             self.active_hunk = Some(h);
+        }
+        if let Some(s) = clicked_symbol {
+            self.selected_symbol = Some(s);
         }
     }
 }
@@ -1123,32 +1309,87 @@ fn split_align(rows: &[diff::DiffLineRow]) -> Vec<RenderRow> {
 
 /// Draw one side of a split-diff row: kind-tinted background + gutter + spans.
 /// An empty cell (no kind) draws a faint filler so the gutter aligns.
-fn split_cell(ui: &mut egui::Ui, kind: Option<LineKind>, spans: &[(Color32, String)]) {
+fn split_cell(
+    ui: &mut egui::Ui,
+    kind: Option<LineKind>,
+    spans: &[(Color32, String)],
+    selected: Option<&str>,
+) -> Option<String> {
     let (bg, gutter) = match kind {
         Some(LineKind::Add) => (Some(Color32::from_rgb(22, 50, 22)), "+ "),
         Some(LineKind::Del) => (Some(Color32::from_rgb(55, 22, 22)), "- "),
         Some(LineKind::Ctx) => (None, "  "),
         None => (Some(Color32::from_rgb(28, 28, 30)), "  "), // empty filler
     };
-    let draw = |ui: &mut egui::Ui| line_row(ui, gutter, spans);
     if let Some(bg) = bg {
-        egui::Frame::none().fill(bg).show(ui, draw);
+        egui::Frame::none()
+            .fill(bg)
+            .show(ui, |ui| line_row(ui, gutter, spans, selected))
+            .inner
     } else {
-        draw(ui);
+        line_row(ui, gutter, spans, selected)
     }
 }
 
-/// Draw a single monospace content line: optional gutter + highlighted spans.
-fn line_row(ui: &mut egui::Ui, gutter: &str, spans: &[(Color32, String)]) {
+/// Is `c` part of a code identifier?
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Draw a monospace content line: gutter + highlighted spans, with
+/// identifier tokens rendered as clickable (for go-to-definition). Returns
+/// the identifier the user clicked this frame, if any. `selected` is the
+/// currently-selected symbol, drawn with an underline/highlight.
+fn line_row(
+    ui: &mut egui::Ui,
+    gutter: &str,
+    spans: &[(Color32, String)],
+    selected: Option<&str>,
+) -> Option<String> {
+    let mut clicked: Option<String> = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         if !gutter.is_empty() {
             ui.label(egui::RichText::new(gutter).monospace().color(Color32::DARK_GRAY));
         }
         for (color, text) in spans {
-            ui.label(egui::RichText::new(text).monospace().color(*color));
+            // Split the span into identifier / non-identifier runs; make
+            // identifiers clickable so a click selects the symbol.
+            let mut buf = String::new();
+            let mut buf_ident = false;
+            let flush = |ui: &mut egui::Ui, s: &str, ident: bool, clicked: &mut Option<String>| {
+                if s.is_empty() {
+                    return;
+                }
+                let mut rt = egui::RichText::new(s).monospace().color(*color);
+                if ident && selected == Some(s) {
+                    rt = rt.underline().background_color(Color32::from_rgb(60, 60, 30));
+                }
+                if ident {
+                    let resp = ui.add(egui::Label::new(rt).sense(egui::Sense::click()));
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        *clicked = Some(s.to_string());
+                    }
+                } else {
+                    ui.label(rt);
+                }
+            };
+            for ch in text.chars() {
+                let ci = is_ident_char(ch);
+                if ci != buf_ident && !buf.is_empty() {
+                    flush(ui, &buf, buf_ident, &mut clicked);
+                    buf.clear();
+                }
+                buf_ident = ci;
+                buf.push(ch);
+            }
+            flush(ui, &buf, buf_ident, &mut clicked);
         }
     });
+    clicked
 }
 
 /// Recursively render the lazy file tree. Directories expand on click

@@ -3,6 +3,7 @@
 //! benchmarks. Pure logic lives here; `main.rs` is just the egui shell.
 
 pub mod diff;
+pub mod gotodef;
 pub mod highlight;
 pub mod review_state;
 pub mod tree;
