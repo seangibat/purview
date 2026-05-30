@@ -15,7 +15,7 @@ use egui::Color32;
 use git2::Repository;
 
 use purview::diff::{self, ChangedFile, DiffSource, Hunk, LineKind, ReviewStatus};
-use purview::highlight::{Highlighter, IncrementalHl};
+use purview::highlight::{Highlighter, IncrementalHl, Spans};
 use purview::review_state::{FileState, HunkState, Replies, ReviewState};
 use purview::tree::{FileTree, Node};
 
@@ -41,7 +41,10 @@ fn main() -> eframe::Result<()> {
 
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
+    /// Unified inline diff (+/- in one column).
     Diff,
+    /// Side-by-side: old (left) vs new (right), aligned per hunk.
+    Split,
     FullFile,
 }
 
@@ -65,6 +68,13 @@ enum RenderRow {
     DiffLine { kind: LineKind, text: String },
     /// A full-file content line, raw text.
     Plain { text: String },
+    /// A side-by-side row: a cell on each side, either of which may be empty
+    /// (a deletion has no right cell; an addition has no left cell; context
+    /// shows on both). Highlighted lazily via `split_spans`.
+    SplitLine {
+        left: Option<(LineKind, String)>,
+        right: Option<(LineKind, String)>,
+    },
 }
 
 struct App {
@@ -99,6 +109,8 @@ struct App {
     /// advancing as far as the user has scrolled. None for diff view (its
     /// rows aren't contiguous source — per-line highlighting is correct).
     incr: std::cell::RefCell<Option<IncrementalHl>>,
+    /// Lazy memo for split-view rows: (left_spans, right_spans) per cache row.
+    split_cache: std::cell::RefCell<Vec<Option<(Spans, Spans)>>>,
 }
 
 impl App {
@@ -127,6 +139,7 @@ impl App {
             cache_path: String::new(),
             hl_cache: std::cell::RefCell::new(Vec::new()),
             incr: std::cell::RefCell::new(None),
+            split_cache: std::cell::RefCell::new(Vec::new()),
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -359,6 +372,17 @@ impl App {
                     }
                 }
             }
+            (Selection::Changed(idx), ViewMode::Split) => {
+                let file = &self.files[*idx];
+                path = file.path.clone();
+                for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                    out.push(RenderRow::HunkHeader {
+                        hunk_idx,
+                        text: hunk.header.clone(),
+                    });
+                    out.extend(split_align(&hunk.rows));
+                }
+            }
             (sel, ViewMode::FullFile) => {
                 path = match sel {
                     Selection::Changed(idx) => self.files[*idx].path.clone(),
@@ -375,7 +399,7 @@ impl App {
                     }),
                 }
             }
-            // (Path, Diff) is impossible — forced to FullFile above.
+            // (Path, Diff) / (Path, Split) impossible — forced to FullFile above.
             _ => {}
         }
 
@@ -385,6 +409,7 @@ impl App {
         self.cache_path = path;
         self.cache_key = Some(key);
         *self.hl_cache.borrow_mut() = vec![None; n];
+        *self.split_cache.borrow_mut() = vec![None; n];
         // Full-file view highlights incrementally-but-statefully; diff view
         // highlights each (non-contiguous) row independently.
         *self.incr.borrow_mut() = if full_file {
@@ -410,8 +435,34 @@ impl App {
                 self.hl_cache.borrow_mut()[i] = Some(spans.clone());
                 spans
             }
+            RenderRow::SplitLine { .. } => Vec::new(),
             RenderRow::Plain { .. } => self.highlight_full_file_upto(i),
         }
+    }
+
+    /// Lazily highlighted (left, right) spans for a split-view row `i`,
+    /// memoized. Each side is highlighted per-line (diff fragments aren't
+    /// contiguous source).
+    fn split_spans(&self, i: usize) -> (Spans, Spans) {
+        if let Some(pair) = &self.split_cache.borrow()[i] {
+            return pair.clone();
+        }
+        let (left, right) = match &self.cache[i] {
+            RenderRow::SplitLine { left, right } => {
+                let l = left
+                    .as_ref()
+                    .map(|(_, t)| self.hl.highlight_line(&self.cache_path, t))
+                    .unwrap_or_default();
+                let r = right
+                    .as_ref()
+                    .map(|(_, t)| self.hl.highlight_line(&self.cache_path, t))
+                    .unwrap_or_default();
+                (l, r)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        self.split_cache.borrow_mut()[i] = Some((left.clone(), right.clone()));
+        (left, right)
     }
 
     /// Advance the incremental highlighter through rows [next..=i], caching
@@ -462,7 +513,8 @@ impl App {
                         self.reload();
                     }
                     ui.selectable_value(&mut self.view, ViewMode::FullFile, "Full File");
-                    ui.selectable_value(&mut self.view, ViewMode::Diff, "Diff");
+                    ui.selectable_value(&mut self.view, ViewMode::Split, "Split");
+                    ui.selectable_value(&mut self.view, ViewMode::Diff, "Unified");
                     ui.separator();
                     if ui.button("report").clicked() {
                         match self.write_report() {
@@ -732,6 +784,15 @@ impl App {
                                 let spans = self.row_spans(i); // lazy, memoized
                                 line_row(ui, "", &spans);
                             }
+                            RenderRow::SplitLine { left, right } => {
+                                let lkind = left.as_ref().map(|(k, _)| *k);
+                                let rkind = right.as_ref().map(|(k, _)| *k);
+                                let (lspans, rspans) = self.split_spans(i);
+                                ui.columns(2, |cols| {
+                                    split_cell(&mut cols[0], lkind, &lspans);
+                                    split_cell(&mut cols[1], rkind, &rspans);
+                                });
+                            }
                         }
                     }
                 },
@@ -751,6 +812,61 @@ impl App {
         if let Some(h) = open_comment {
             self.active_hunk = Some(h);
         }
+    }
+}
+
+/// Align a hunk's unified rows into side-by-side rows. Context lines show on
+/// both sides; runs of deletions/additions are paired row-for-row (del↔add),
+/// with any surplus shown one-sided (deletion → left only, addition → right
+/// only). This is the standard split-diff pairing.
+fn split_align(rows: &[diff::DiffLineRow]) -> Vec<RenderRow> {
+    let mut out: Vec<RenderRow> = Vec::new();
+    let mut dels: Vec<String> = Vec::new();
+    let mut adds: Vec<String> = Vec::new();
+
+    // Flush buffered deletions/additions as paired/one-sided split rows.
+    let flush = |out: &mut Vec<RenderRow>, dels: &mut Vec<String>, adds: &mut Vec<String>| {
+        let pairs = dels.len().max(adds.len());
+        for i in 0..pairs {
+            let left = dels.get(i).map(|t| (LineKind::Del, t.clone()));
+            let right = adds.get(i).map(|t| (LineKind::Add, t.clone()));
+            out.push(RenderRow::SplitLine { left, right });
+        }
+        dels.clear();
+        adds.clear();
+    };
+
+    for r in rows {
+        match r.kind {
+            LineKind::Del => dels.push(r.text.clone()),
+            LineKind::Add => adds.push(r.text.clone()),
+            LineKind::Ctx => {
+                flush(&mut out, &mut dels, &mut adds);
+                out.push(RenderRow::SplitLine {
+                    left: Some((LineKind::Ctx, r.text.clone())),
+                    right: Some((LineKind::Ctx, r.text.clone())),
+                });
+            }
+        }
+    }
+    flush(&mut out, &mut dels, &mut adds);
+    out
+}
+
+/// Draw one side of a split-diff row: kind-tinted background + gutter + spans.
+/// An empty cell (no kind) draws a faint filler so the gutter aligns.
+fn split_cell(ui: &mut egui::Ui, kind: Option<LineKind>, spans: &[(Color32, String)]) {
+    let (bg, gutter) = match kind {
+        Some(LineKind::Add) => (Some(Color32::from_rgb(22, 50, 22)), "+ "),
+        Some(LineKind::Del) => (Some(Color32::from_rgb(55, 22, 22)), "- "),
+        Some(LineKind::Ctx) => (None, "  "),
+        None => (Some(Color32::from_rgb(28, 28, 30)), "  "), // empty filler
+    };
+    let draw = |ui: &mut egui::Ui| line_row(ui, gutter, spans);
+    if let Some(bg) = bg {
+        egui::Frame::none().fill(bg).show(ui, draw);
+    } else {
+        draw(ui);
     }
 }
 
@@ -846,7 +962,9 @@ mod ui_tests {
         assert!(!app.files.is_empty(), "the working-tree edit should produce a diff");
 
         let ctx = egui::Context::default();
-        frame(&ctx, &mut app); // Diff view
+        frame(&ctx, &mut app); // Unified diff view
+        app.view = ViewMode::Split;
+        frame(&ctx, &mut app); // Side-by-side view
         app.view = ViewMode::FullFile;
         frame(&ctx, &mut app); // Full-file view
         app.view = ViewMode::Diff;
@@ -902,5 +1020,49 @@ mod ui_tests {
             "the click should have persisted approved status to disk"
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn row(kind: LineKind, t: &str) -> diff::DiffLineRow {
+        diff::DiffLineRow { kind, text: t.into() }
+    }
+
+    #[test]
+    fn split_align_pairs_dels_with_adds_and_mirrors_context() {
+        // ctx, then 2 dels + 3 adds, then ctx.
+        let rows = vec![
+            row(LineKind::Ctx, "a"),
+            row(LineKind::Del, "old1"),
+            row(LineKind::Del, "old2"),
+            row(LineKind::Add, "new1"),
+            row(LineKind::Add, "new2"),
+            row(LineKind::Add, "new3"),
+            row(LineKind::Ctx, "z"),
+        ];
+        let out = split_align(&rows);
+        // ctx(a) | 3 paired/surplus rows | ctx(z) = 5 rows.
+        assert_eq!(out.len(), 5);
+
+        let cell = |r: &RenderRow, side: usize| -> Option<(LineKind, String)> {
+            match r {
+                RenderRow::SplitLine { left, right } => {
+                    if side == 0 { left.clone() } else { right.clone() }
+                }
+                _ => None,
+            }
+        };
+        // Row 0: context on both sides.
+        assert_eq!(cell(&out[0], 0), Some((LineKind::Ctx, "a".into())));
+        assert_eq!(cell(&out[0], 1), Some((LineKind::Ctx, "a".into())));
+        // Row 1: del1 ↔ add1.
+        assert_eq!(cell(&out[1], 0), Some((LineKind::Del, "old1".into())));
+        assert_eq!(cell(&out[1], 1), Some((LineKind::Add, "new1".into())));
+        // Row 2: del2 ↔ add2.
+        assert_eq!(cell(&out[2], 0), Some((LineKind::Del, "old2".into())));
+        assert_eq!(cell(&out[2], 1), Some((LineKind::Add, "new2".into())));
+        // Row 3: surplus add3 → right only, left empty.
+        assert_eq!(cell(&out[3], 0), None);
+        assert_eq!(cell(&out[3], 1), Some((LineKind::Add, "new3".into())));
+        // Row 4: context on both sides.
+        assert_eq!(cell(&out[4], 0), Some((LineKind::Ctx, "z".into())));
     }
 }
