@@ -3,6 +3,23 @@ name = "purview"
 version = "0.1.0"
 edition = "2021"
 description = "Codebase-first code review — the diff is an overlay on the repo, not the unit of work."
+license = "MIT"
+authors = ["Sean Aucremanne"]
+
+# Debian package metadata (cargo-deb). Builds a .deb that installs both
+# binaries to /usr/bin and registers a .desktop launcher + icon.
+[package.metadata.deb]
+maintainer = "Sean Aucremanne <sean.aucremanne@gmail.com>"
+copyright = "2026, Sean Aucremanne"
+extended-description = "purview is a native code-review tool for AI-generated changes: a codebase IDE with the diff as an overlay, with Claude as a first-class participant via an MCP server."
+section = "devel"
+priority = "optional"
+assets = [
+    ["target/release/purview", "usr/bin/", "755"],
+    ["target/release/purview-mcp", "usr/bin/", "755"],
+    ["packaging/purview.desktop", "usr/share/applications/", "644"],
+    ["packaging/purview.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+]
 
 [dependencies]
 eframe = "0.30"

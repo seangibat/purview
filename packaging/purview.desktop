@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=purview
+GenericName=Code Review
+Comment=Codebase-first code review for AI-generated changes
+Exec=purview %f
+Icon=purview
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=code;review;diff;git;
