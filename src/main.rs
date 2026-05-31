@@ -12,18 +12,27 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use egui::Color32;
-use git2::Repository;
 
 use purview::diff::{self, ChangedFile, DiffSource, Hunk, LineKind, ReviewStatus};
 use purview::highlight::{Highlighter, IncrementalHl, Spans};
+use purview::repo::{self, RepoSource};
 use purview::review_state::{FileState, HunkState, Replies, ReviewState};
-use purview::tree::{self, FileTree, Node};
+use purview::tree::{self, Node};
 
 fn main() -> eframe::Result<()> {
-    let repo_path = std::env::args()
+    // The argument is either a local path (default) or an `ssh://...` URL for
+    // reviewing a repo on a remote machine. `repo::open` picks the backend.
+    let arg = std::env::args()
         .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
+        .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into_owned());
+
+    let source: Box<dyn RepoSource> = match repo::open(&arg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("purview: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -35,7 +44,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "purview",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(App::new(repo_path)))),
+        Box::new(move |_cc| Ok(Box::new(App::new(source)))),
     )
 }
 
@@ -111,7 +120,8 @@ enum RenderRow {
 }
 
 struct App {
-    repo_path: PathBuf,
+    /// Repo backend — local (git2 + fs) or SSH. The UI only talks to this.
+    repo: Box<dyn RepoSource>,
     branch: String,
     base: String,
     base_input: String,
@@ -122,7 +132,11 @@ struct App {
     active_hunk: Option<usize>,
     layout: Layout,
     extent: Extent,
-    tree: FileTree,
+    /// Lazy repo file tree (children loaded via `self.repo` on first expand).
+    tree_nodes: Vec<Node>,
+    /// Local directory where review state (`.purview/`) is read/written. For a
+    /// local repo this is the workdir; for SSH it's a local mirror dir.
+    state_root: PathBuf,
     /// Ctrl+P fuzzy file-open overlay state. Some = open.
     quick_open: Option<QuickOpen>,
     /// Go-to-definition overlay state. Some = open.
@@ -168,13 +182,17 @@ struct App {
 }
 
 impl App {
-    fn new(repo_path: PathBuf) -> Self {
-        let tree_root = Repository::discover(&repo_path)
-            .ok()
-            .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
-            .unwrap_or_else(|| repo_path.clone());
+    fn new(repo: Box<dyn RepoSource>) -> Self {
+        let state_root = repo.state_root().to_path_buf();
+        // Root-level tree nodes (lazy; children load on expand via self.repo).
+        let tree_nodes = repo
+            .list_dir("")
+            .unwrap_or_default()
+            .into_iter()
+            .map(node_from_entry)
+            .collect();
         let mut app = App {
-            repo_path,
+            repo,
             branch: String::new(),
             base: String::new(),
             base_input: String::new(),
@@ -184,7 +202,8 @@ impl App {
             active_hunk: None,
             layout: Layout::Inline,
             extent: Extent::Summary,
-            tree: FileTree::new(tree_root),
+            tree_nodes,
+            state_root,
             quick_open: None,
             goto: None,
             selected_symbol: None,
@@ -214,14 +233,7 @@ impl App {
     /// Pick a default base branch: first of main / master / develop / trunk
     /// that resolves in the repo, else "main".
     fn guess_default_base(&self) -> String {
-        if let Ok(repo) = Repository::discover(&self.repo_path) {
-            for cand in ["main", "master", "develop", "trunk"] {
-                if repo.revparse_single(cand).is_ok() {
-                    return cand.to_string();
-                }
-            }
-        }
-        "main".to_string()
+        self.repo.guess_default_base()
     }
 
     fn reload(&mut self) {
@@ -246,8 +258,8 @@ impl App {
         }
     }
 
-    fn compute_diff(&self) -> Result<(String, Vec<ChangedFile>), git2::Error> {
-        diff::compute(&self.repo_path, self.source, &self.base)
+    fn compute_diff(&self) -> Result<(String, Vec<ChangedFile>), String> {
+        self.repo.compute_diff(self.source, &self.base)
     }
 
     /// (reviewed, total) hunks across all changed files.
@@ -368,7 +380,7 @@ impl App {
                 })
                 .collect(),
         };
-        let _ = state.save(&self.tree.root);
+        let _ = state.save(&self.state_root);
     }
 
     fn count_status(&self, status: ReviewStatus) -> usize {
@@ -379,34 +391,26 @@ impl App {
             .count()
     }
 
-    /// Write the report to <repo>/.purview/review-report.md; return its path.
+    /// Write the report to <state_root>/.purview/review-report.md; return path.
     fn write_report(&self) -> std::io::Result<PathBuf> {
-        let dir = self.tree.root.join(".purview");
+        let dir = self.state_root.join(".purview");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("review-report.md");
         std::fs::write(&path, self.review_report())?;
         Ok(path)
     }
 
-    /// Read the full working-tree file for the selected path. The repo
-    /// workdir is already known (tree.root) — no need to re-discover.
-    fn read_full_file(&self, rel: &str) -> std::io::Result<String> {
-        std::fs::read_to_string(self.tree.root.join(rel))
+    /// Read the full current (working/new side) contents of `rel` via the repo
+    /// backend (local fs or remote cat).
+    fn read_full_file(&self, rel: &str) -> Result<String, String> {
+        self.repo.read_file(rel)
     }
 
     /// Write `new_text` to the file's line `line0` (0-based), preserving the
     /// rest. Only valid in full-file (Plain) view, where cache row == file
-    /// line. Returns Ok on success.
-    fn write_line(&self, rel: &str, line0: usize, new_text: &str) -> std::io::Result<()> {
-        let path = self.tree.root.join(rel);
-        let content = std::fs::read_to_string(&path)?;
-        let out = replace_nth_line(&content, line0, new_text).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "line out of range")
-        })?;
-        // Atomic: temp + rename, so a concurrent reader never sees half.
-        let tmp = path.with_extension("purview-tmp");
-        std::fs::write(&tmp, out)?;
-        std::fs::rename(&tmp, &path)
+    /// line. Routed through the repo backend (no-op/error in ssh mode).
+    fn write_line(&self, rel: &str, line0: usize, new_text: &str) -> Result<(), String> {
+        self.repo.write_line(rel, line0, new_text)
     }
 
     /// Rebuild the (raw, un-highlighted) render cache if selection/view
@@ -438,13 +442,8 @@ impl App {
                 // whole file shown, changes overlaid). Summary uses the
                 // already-computed 3-line-context hunks.
                 let hunks: Vec<diff::Hunk> = if self.extent == Extent::Full {
-                    diff::compute_with(
-                        &self.repo_path,
-                        self.source,
-                        &self.base,
-                        u32::MAX,
-                        Some(&path),
-                    )
+                    self.repo
+                        .compute_file_diff(self.source, &self.base, u32::MAX, &path)
                     .ok()
                     .and_then(|(_, mut files)| {
                         files
@@ -613,8 +612,20 @@ impl App {
         if symbol.trim().is_empty() {
             return;
         }
+        // Go-to-definition (git grep + Claude CLI) runs against a local
+        // workdir; not supported over SSH in v1. Disable with a clear note.
+        if !self.repo.supports_goto() {
+            self.goto = Some(Goto {
+                query: symbol,
+                just_opened: false,
+                resolving: false,
+                rx: None,
+                note: "go-to-definition is disabled in ssh mode (v1)".to_string(),
+            });
+            return;
+        }
         let symbol = symbol.trim().to_string();
-        let root = self.tree.root.clone();
+        let root = self.state_root.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_symbol = symbol.clone();
         std::thread::spawn(move || {
@@ -899,7 +910,7 @@ impl App {
             if self.quick_open.is_some() {
                 self.quick_open = None;
             } else {
-                let (all, truncated) = tree::collect_files(&self.tree.root, 50_000);
+                let (all, truncated) = self.repo.list_all_files(50_000);
                 self.quick_open = Some(QuickOpen {
                     query: String::new(),
                     all,
@@ -917,7 +928,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.heading("purview");
                 ui.separator();
-                ui.label(format!("repo: {}", self.repo_path.to_string_lossy()));
+                ui.label(format!("repo: {}", self.repo.label()));
                 ui.separator();
                 ui.label(format!("branch: {}", self.branch));
                 ui.separator();
@@ -1034,10 +1045,9 @@ impl App {
                     .id_salt("tree")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let root = self.tree.root.clone();
                         let mut clicked: Option<String> = None;
                         let cur = self.selected.clone();
-                        render_tree(ui, &root, &mut self.tree.nodes, &cur, &mut clicked);
+                        render_tree(ui, self.repo.as_ref(), &mut self.tree_nodes, &cur, &mut clicked);
                         if let Some(rel) = clicked {
                             self.selected = Some(Selection::Path(rel));
                         }
@@ -1063,13 +1073,16 @@ impl App {
         // buffer while `self` is immutably borrowed for the cache.
         let edit_row = self.editing.as_ref().map(|(r, _)| *r);
         let mut edit_buf = self.editing.as_ref().map(|(_, b)| b.clone()).unwrap_or_default();
+        // Inline editing writes back to the repo; only the local backend
+        // supports it. In ssh mode the file view stays read-only.
+        let can_edit = self.repo.supports_editing();
         let mut edit_start: Option<(usize, String)> = None;
         let mut edit_commit: Option<(usize, String)> = None;
         let mut edit_cancel = false;
         // Agent replies, loaded once per frame (tiny dir). Used for both the
         // per-hunk indicator and the open thread. Poll while a changed file is
         // shown so a reply posted by the agent surfaces without interaction.
-        let replies = Replies::load(&self.tree.root);
+        let replies = Replies::load(&self.state_root);
         if active_file.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs(2));
         }
@@ -1276,7 +1289,7 @@ impl App {
                                         .scope(|ui| line_row(ui, "", &spans, None, false))
                                         .response
                                         .interact(egui::Sense::click());
-                                    if resp.double_clicked() {
+                                    if can_edit && resp.double_clicked() {
                                         edit_start = Some((i, text.clone()));
                                     }
                                 }
@@ -1409,20 +1422,14 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Replace 0-based line `n` of `content` with `new`, preserving the file's
-/// trailing-newline state. None if `n` is out of range.
-fn replace_nth_line(content: &str, n: usize, new: &str) -> Option<String> {
-    let had_trailing_nl = content.ends_with('\n');
-    let mut lines: Vec<&str> = content.lines().collect();
-    if n >= lines.len() {
-        return None;
+/// Build a lazy tree [`Node`] from a backend [`repo::DirEntry`].
+fn node_from_entry(e: repo::DirEntry) -> Node {
+    Node {
+        name: e.name,
+        rel: e.rel,
+        is_dir: e.is_dir,
+        children: None,
     }
-    lines[n] = new;
-    let mut out = lines.join("\n");
-    if had_trailing_nl {
-        out.push('\n');
-    }
-    Some(out)
 }
 
 /// Draw a monospace content line: gutter + highlighted spans, with
@@ -1488,7 +1495,7 @@ fn line_row(
 /// their rel path via `clicked`.
 fn render_tree(
     ui: &mut egui::Ui,
-    root: &std::path::Path,
+    repo: &dyn RepoSource,
     nodes: &mut [Node],
     cur: &Option<Selection>,
     clicked: &mut Option<String>,
@@ -1501,10 +1508,18 @@ fn render_tree(
                     ui.label(format!("📁 {}", node.name));
                 })
                 .body(|ui| {
-                    // Lazy-load children on first expansion.
-                    FileTree::load_children(root, node);
+                    // Lazy-load children on first expansion via the backend.
+                    if node.children.is_none() {
+                        node.children = Some(
+                            repo.list_dir(&node.rel)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(node_from_entry)
+                                .collect(),
+                        );
+                    }
                     if let Some(children) = node.children.as_mut() {
-                        render_tree(ui, root, children, cur, clicked);
+                        render_tree(ui, repo, children, cur, clicked);
                     }
                 });
         } else {
@@ -1519,7 +1534,13 @@ fn render_tree(
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    use purview::repo::LocalRepo;
     use std::process::Command;
+
+    /// Build an App over a local repo path (the default backend).
+    fn local_app(path: &std::path::Path) -> App {
+        App::new(Box::new(LocalRepo::new(path.to_path_buf())))
+    }
 
     /// A throwaway git repo with one committed file and a working-tree edit,
     /// so the App opens with a diff containing at least one hunk.
@@ -1557,7 +1578,7 @@ mod ui_tests {
     #[test]
     fn app_opens_with_a_diff_and_renders_all_states_without_panic() {
         let repo = fixture_repo();
-        let mut app = App::new(repo.clone());
+        let mut app = local_app(&repo);
         assert!(app.selected.is_some(), "a changed file should be auto-selected");
         assert!(!app.files.is_empty(), "the working-tree edit should produce a diff");
 
@@ -1583,7 +1604,7 @@ mod ui_tests {
         // The click handler just sets this status; verify the persistence the
         // GUI then performs round-trips to disk.
         let repo = fixture_repo();
-        let mut app = App::new(repo.clone());
+        let mut app = local_app(&repo);
         app.files[0].hunks[0].status = ReviewStatus::Approved;
         app.save_review_state();
 
@@ -1599,7 +1620,7 @@ mod ui_tests {
     fn clicking_approve_button_flips_status_and_persists() {
         use egui_kittest::kittest::Queryable; // get_by_label lives here
         let repo = fixture_repo();
-        let app = App::new(repo.clone());
+        let app = local_app(&repo);
         // Harness carries the App as state; the closure renders it each frame.
         let mut harness = egui_kittest::Harness::new_state(
             |ctx, app: &mut App| app.ui(ctx),
@@ -1633,16 +1654,16 @@ mod ui_tests {
     #[test]
     fn replace_nth_line_preserves_trailing_newline() {
         assert_eq!(
-            super::replace_nth_line("a\nb\nc\n", 1, "B"),
+            diff::replace_nth_line("a\nb\nc\n", 1, "B"),
             Some("a\nB\nc\n".to_string())
         );
         // no trailing newline preserved
         assert_eq!(
-            super::replace_nth_line("a\nb\nc", 2, "C"),
+            diff::replace_nth_line("a\nb\nc", 2, "C"),
             Some("a\nb\nC".to_string())
         );
         // out of range
-        assert_eq!(super::replace_nth_line("a\nb\n", 5, "x"), None);
+        assert_eq!(diff::replace_nth_line("a\nb\n", 5, "x"), None);
     }
 
     #[test]

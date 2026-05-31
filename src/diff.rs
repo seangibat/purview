@@ -193,6 +193,106 @@ pub fn compute_with(
     Ok((branch, files))
 }
 
+/// Parse a unified-diff patch (the text `git diff` prints) into the same
+/// [`ChangedFile`] / [`Hunk`] model `compute_with` produces from git2. This
+/// is the shared parser for the SSH backend, which gets raw patch text from
+/// the remote `git diff` rather than a git2 `Diff` object.
+///
+/// It keys file boundaries off `diff --git a/<p> b/<p>` lines, hunk
+/// boundaries off `@@ ... @@` lines, and classifies content lines by their
+/// leading `+`/`-`/space — the same way git2's per-line callback does.
+pub fn parse_unified_patch(patch: &str) -> Vec<ChangedFile> {
+    let mut files: Vec<ChangedFile> = Vec::new();
+    let mut in_hunks = false; // true once we've seen the first @@ for a file
+
+    for line in patch.split('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // "a/<path> b/<path>" — take the b-side path (new file), falling
+            // back to the a-side. Both are prefixed a/ and b/.
+            let path = parse_diff_git_path(rest);
+            files.push(ChangedFile {
+                path,
+                hunks: Vec::new(),
+            });
+            in_hunks = false;
+            continue;
+        }
+        if line.starts_with("@@") {
+            // Hunk header: "@@ -l,s +l,s @@ optional section heading".
+            if let Some(file) = files.last_mut() {
+                file.hunks.push(Hunk::new(line.to_string()));
+                in_hunks = true;
+            }
+            continue;
+        }
+        if !in_hunks {
+            // Skip file-metadata lines (index, ---, +++, mode, etc.).
+            continue;
+        }
+        let Some(file) = files.last_mut() else { continue };
+        let (kind, text) = match line.as_bytes().first() {
+            Some(b'+') => (LineKind::Add, &line[1..]),
+            Some(b'-') => (LineKind::Del, &line[1..]),
+            Some(b' ') => (LineKind::Ctx, &line[1..]),
+            // "\ No newline at end of file" and blank trailing line: ignore.
+            _ => continue,
+        };
+        if let Some(h) = file.hunks.last_mut() {
+            h.rows.push(DiffLineRow {
+                kind,
+                text: text.to_string(),
+            });
+        }
+    }
+    files
+}
+
+/// Extract the file path from a `diff --git a/<p> b/<p>` line's tail. Prefers
+/// the b-side; both sides equal for a normal edit. Paths with spaces work
+/// because the a/ and b/ prefixes bracket each side.
+fn parse_diff_git_path(rest: &str) -> String {
+    // Find " b/" which separates the a-side from the b-side.
+    if let Some(idx) = rest.find(" b/") {
+        return rest[idx + 3..].to_string();
+    }
+    // Fallback: strip a leading "a/" off the whole thing.
+    rest.strip_prefix("a/").unwrap_or(rest).to_string()
+}
+
+/// Build a [`ChangedFile`] for an untracked file: one hunk, every line an
+/// addition. Mirrors how the local backend (git2 with show_untracked_content)
+/// surfaces a brand-new file.
+pub fn untracked_as_changed_file(path: &str, content: &str) -> ChangedFile {
+    let mut hunk = Hunk::new(format!("@@ -0,0 +1,{} @@", content.lines().count()));
+    for line in content.lines() {
+        hunk.rows.push(DiffLineRow {
+            kind: LineKind::Add,
+            text: line.to_string(),
+        });
+    }
+    ChangedFile {
+        path: path.to_string(),
+        hunks: vec![hunk],
+    }
+}
+
+/// Replace 0-based line `n` of `content` with `new`, preserving the file's
+/// trailing-newline state. None if `n` is out of range. Shared by the local
+/// inline-edit write-back path.
+pub fn replace_nth_line(content: &str, n: usize, new: &str) -> Option<String> {
+    let had_trailing_nl = content.ends_with('\n');
+    let mut lines: Vec<&str> = content.lines().collect();
+    if n >= lines.len() {
+        return None;
+    }
+    lines[n] = new;
+    let mut out = lines.join("\n");
+    if had_trailing_nl {
+        out.push('\n');
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

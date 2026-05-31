@@ -5,5 +5,6 @@
 pub mod diff;
 pub mod gotodef;
 pub mod highlight;
+pub mod repo;
 pub mod review_state;
 pub mod tree;

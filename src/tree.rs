@@ -117,7 +117,7 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
 
 /// List immediate children of `rel` (relative dir path, "" = root),
 /// gitignore-aware, dirs first then files, both alphabetical.
-fn read_children(root: &Path, rel: &str) -> Vec<Node> {
+pub fn read_children(root: &Path, rel: &str) -> Vec<Node> {
     let abs = if rel.is_empty() {
         root.to_path_buf()
     } else {
