@@ -122,6 +122,20 @@ pub trait RepoSource: Send + Sync {
     /// a local repo this is the workdir; for SSH it's a local mirror dir so
     /// the MCP server (which runs locally) can still read it.
     fn state_root(&self) -> &Path;
+
+    /// Persist a review-state file (`relname`, e.g. `review-state.json` or
+    /// `review-report.md`) into the repo's `.purview/` dir, WHERE the repo
+    /// lives. For [`LocalRepo`] that's `<workdir>/.purview/<relname>` on the
+    /// local fs; for [`SshRepo`] that's `<remote-repo>/.purview/<relname>` on
+    /// the remote (so the remote `purview-mcp` server reads it natively),
+    /// *plus* a copy in the local mirror dir for the local MCP fallback.
+    ///
+    /// The `.purview/` dir is created if missing and made self-ignoring (a
+    /// `.gitignore` of `*`) so review state never pollutes git status.
+    ///
+    /// Blocking — for SSH this is one remote write. Called on infrequent user
+    /// actions (approve/reject/comment), so a quick round trip is acceptable.
+    fn persist_state(&self, relname: &str, contents: &str) -> Result<(), String>;
 }
 
 /// One entry in a directory listing.
@@ -233,6 +247,17 @@ impl RepoSource for LocalRepo {
     fn state_root(&self) -> &Path {
         &self.root
     }
+
+    fn persist_state(&self, relname: &str, contents: &str) -> Result<(), String> {
+        // Create (+ self-ignore) the workdir's .purview/ and write atomically,
+        // exactly as the GUI did before this was routed through the trait.
+        let dir = crate::review_state::ensure_purview_dir(&self.root)
+            .map_err(|e| e.to_string())?;
+        let path = dir.join(relname);
+        let tmp = path.with_extension("purview-tmp");
+        std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    }
 }
 
 /// The current branch's upstream tracking ref as a short name (e.g.
@@ -295,6 +320,29 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-qm", "init"]);
         (dir, git)
+    }
+
+    /// `LocalRepo::persist_state` writes the file into `<workdir>/.purview/`,
+    /// the content round-trips, and the dir self-ignores via `.gitignore`.
+    #[test]
+    fn local_persist_state_writes_into_purview_and_self_ignores() {
+        let (dir, _git) = repo_dir();
+        let repo = LocalRepo::new(dir.clone());
+        let body = "{\"hello\":\"world\"}\n";
+        repo.persist_state("review-state.json", body).unwrap();
+
+        let written = dir.join(".purview").join("review-state.json");
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            body,
+            "persisted content should round-trip from disk"
+        );
+        let gi = dir.join(".purview").join(".gitignore");
+        assert!(gi.exists(), ".purview/.gitignore should exist");
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "*\n");
+        // No temp file left behind by the atomic write.
+        assert!(!written.with_extension("purview-tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With no upstream tracking ref configured, the default base falls back to

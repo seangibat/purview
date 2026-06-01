@@ -498,6 +498,42 @@ impl RepoSource for SshRepo {
     fn state_root(&self) -> &Path {
         &self.state_root
     }
+
+    fn persist_state(&self, relname: &str, contents: &str) -> Result<(), String> {
+        // The important copy: write into the REMOTE repo's .purview/ so the
+        // remote `purview-mcp` server (run by the user against the same path)
+        // reads it natively. Atomic on the remote — stream the bytes over
+        // ssh's stdin (so content never needs shell-quoting), write a temp
+        // file, then mv it over the target (rename is atomic within an fs).
+        // Also ensure .purview/ self-ignores via a `.gitignore` of `*`,
+        // mirroring `ensure_purview_dir`, so review state never pollutes the
+        // user's git status.
+        let purview = format!("{}/.purview", self.target.path);
+        let qdir = shell_quote(&purview);
+        let dst = shell_quote(&format!("{purview}/{relname}"));
+        let tmp = shell_quote(&format!("{purview}/{relname}.purview.tmp"));
+        let gi = shell_quote(&format!("{purview}/.gitignore"));
+        // Note the doubled braces: the `{ ...; }` shell group is a literal in
+        // the output, not a format placeholder.
+        let remote_cmd = format!(
+            "mkdir -p {qdir} && \
+             {{ [ -f {gi} ] || printf '*\\n' > {gi}; }} && \
+             cat > {tmp} && mv {tmp} {dst}"
+        );
+        self.run_remote_stdin(&remote_cmd, contents.as_bytes())?;
+
+        // Keep the local mirror up to date too (harmless; the local MCP
+        // fallback may read it). Best-effort — a remote success is what
+        // matters, so a local-mirror failure shouldn't fail the action.
+        if let Ok(dir) = crate::review_state::ensure_purview_dir(&self.state_root) {
+            let path = dir.join(relname);
+            let tmp = path.with_extension("purview-tmp");
+            if std::fs::write(&tmp, contents).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SshRepo {

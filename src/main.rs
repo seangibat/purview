@@ -542,7 +542,12 @@ impl App {
                 })
                 .collect(),
         };
-        let _ = state.save(&self.state_root);
+        // Persist WHERE the repo lives (remote over SSH, local fs otherwise)
+        // so the MCP server reads it natively. Serialize once, route through
+        // the backend.
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = self.repo.persist_state("review-state.json", &json);
+        }
     }
 
     fn count_status(&self, status: ReviewStatus) -> usize {
@@ -553,13 +558,15 @@ impl App {
             .count()
     }
 
-    /// Write the report to <state_root>/.purview/review-report.md; return path.
+    /// Write the report to the repo's `.purview/review-report.md` WHERE the
+    /// repo lives (remote over SSH, local fs otherwise) so the MCP server reads
+    /// it natively; return the local mirror path (for the UI "wrote to ..."
+    /// note). For SSH the authoritative copy is on the remote.
     fn write_report(&self) -> std::io::Result<PathBuf> {
-        let dir = self.state_root.join(".purview");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join("review-report.md");
-        std::fs::write(&path, self.review_report())?;
-        Ok(path)
+        self.repo
+            .persist_state("review-report.md", &self.review_report())
+            .map_err(|e| std::io::Error::other(e))?;
+        Ok(self.state_root.join(".purview").join("review-report.md"))
     }
 
     /// Read the full current (working/new side) contents of `rel` via the repo
