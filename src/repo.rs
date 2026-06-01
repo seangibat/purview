@@ -194,6 +194,13 @@ impl RepoSource for LocalRepo {
 
     fn guess_default_base(&self) -> String {
         if let Ok(repo) = git2::Repository::discover(&self.repo_path) {
+            // Prefer the current branch's upstream tracking ref (how Sean does
+            // PR stacking: the base is the parent branch's upstream, e.g.
+            // `origin/feature-parent`). Equivalent to
+            // `git rev-parse --abbrev-ref --symbolic-full-name @{upstream}`.
+            if let Some(up) = local_upstream(&repo) {
+                return up;
+            }
             for cand in ["main", "master", "develop", "trunk"] {
                 if repo.revparse_single(cand).is_ok() {
                     return cand.to_string();
@@ -228,6 +235,20 @@ impl RepoSource for LocalRepo {
     }
 }
 
+/// The current branch's upstream tracking ref as a short name (e.g.
+/// `origin/feature-parent`), or `None` if HEAD is detached or has no upstream
+/// configured. Mirrors `git rev-parse --abbrev-ref --symbolic-full-name
+/// @{upstream}`: git2 gives us `refs/remotes/origin/feature-parent`, which we
+/// shorten the same way git does.
+fn local_upstream(repo: &git2::Repository) -> Option<String> {
+    let head = repo.head().ok()?;
+    let shorthand = head.shorthand()?;
+    let branch = repo.find_branch(shorthand, git2::BranchType::Local).ok()?;
+    let upstream = branch.upstream().ok()?;
+    let name = upstream.get().shorthand()?;
+    Some(name.to_string())
+}
+
 /// Build a [`RepoSource`] from a CLI argument. `ssh://...` yields an
 /// [`SshRepo`]; anything else is a local path → [`LocalRepo`].
 pub fn open(arg: &str) -> Result<Box<dyn RepoSource>, String> {
@@ -235,5 +256,79 @@ pub fn open(arg: &str) -> Result<Box<dyn RepoSource>, String> {
         Ok(Box::new(SshRepo::connect(target)?))
     } else {
         Ok(Box::new(LocalRepo::new(PathBuf::from(arg))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A throwaway git repo + a `git` runner closure bound to it. Starts on a
+    /// branch `main` with one commit, no upstream configured.
+    fn repo_dir() -> (PathBuf, impl Fn(&[&str])) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "purview-repo-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        let git = move |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["checkout", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        (dir, git)
+    }
+
+    /// With no upstream tracking ref configured, the default base falls back to
+    /// the first of main/master/develop/trunk that resolves (here: `main`).
+    #[test]
+    fn guess_default_base_falls_back_without_upstream() {
+        let (dir, _git) = repo_dir();
+        let repo = LocalRepo::new(dir.clone());
+        assert_eq!(repo.guess_default_base(), "main");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the current branch has an upstream tracking ref, the default base is
+    /// that upstream (PR-stacking: the parent branch's upstream), not the
+    /// main/master guess. We model the upstream with a local-self remote
+    /// (`branch.<cur>.remote = .`) so no network/bare repo is needed — git2's
+    /// `branch.upstream()` reads the same config `@{upstream}` resolves through.
+    #[test]
+    fn guess_default_base_prefers_upstream_when_set() {
+        let (dir, git) = repo_dir();
+        // A parent branch the current branch will track.
+        git(&["branch", "feature-parent"]);
+        // Make `main` track `feature-parent` via the local repo as its remote.
+        git(&["config", "branch.main.remote", "."]);
+        git(&["config", "branch.main.merge", "refs/heads/feature-parent"]);
+
+        let repo = LocalRepo::new(dir.clone());
+        let base = repo.guess_default_base();
+        assert_eq!(
+            base, "feature-parent",
+            "upstream tracking ref should be the default base, got {base:?}"
+        );
+        // And the fallback list would NOT have chosen this branch.
+        assert_ne!(base, "main", "must not fall back to main when an upstream is set");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

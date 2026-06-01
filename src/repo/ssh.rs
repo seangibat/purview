@@ -390,6 +390,14 @@ impl RepoSource for SshRepo {
     }
 
     fn guess_default_base(&self) -> String {
+        // Prefer the current branch's upstream tracking ref (PR-stacking base).
+        // Equivalent to `git rev-parse --abbrev-ref @{upstream}`, run remotely.
+        if let Ok(up) = self.run_git(&["rev-parse", "--abbrev-ref", "@{upstream}"]) {
+            let up = up.trim();
+            if !up.is_empty() {
+                return up.to_string();
+            }
+        }
         for cand in ["main", "master", "develop", "trunk"] {
             if self
                 .run_git(&["rev-parse", "--verify", "--quiet", cand])
