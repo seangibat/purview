@@ -16,7 +16,7 @@ use egui::Color32;
 use purview::diff::{self, ChangedFile, DiffSource, Hunk, LineKind, ReviewStatus};
 use purview::highlight::{Highlighter, IncrementalHl, Spans};
 use purview::repo::{self, RepoSource};
-use purview::review_state::{FileState, HunkState, Replies, ReviewState};
+use purview::review_state::{ComparisonKey, FileState, HunkState, Replies, ReviewState};
 use purview::tree::{self, Node};
 
 fn main() -> eframe::Result<()> {
@@ -386,6 +386,11 @@ struct App {
     /// to decide whether the target hunk is already on screen. `None` until the
     /// first content frame paints.
     visible_rows: Option<(usize, usize)>,
+    /// Saved reviewed hunks whose content-anchor no longer appears in the
+    /// current diff (the changed code was removed/reverted). Carried across
+    /// reloads so the reviewer's notes aren't silently dropped; surfaced in the
+    /// report's "Stale (no longer in diff)" section and re-persisted.
+    orphaned: Vec<purview::review_state::OrphanedHunk>,
 }
 
 impl App {
@@ -452,6 +457,7 @@ impl App {
             content_scroll: 0.0,
             content_viewport_h: 0.0,
             visible_rows: None,
+            orphaned: Vec::new(),
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -544,21 +550,60 @@ impl App {
         self.loading = false;
     }
 
-    /// Apply a finished diff result to the UI state.
+    /// The comparison the current `source`/`base` selects. Used to key the
+    /// per-comparison review-state file.
+    fn comparison_key(&self) -> ComparisonKey {
+        match self.source {
+            DiffSource::WorkingTree => ComparisonKey::WorkingTree,
+            DiffSource::BranchRange => ComparisonKey::BranchRange {
+                base: self.base.clone(),
+            },
+        }
+    }
+
+    /// Apply a finished diff result to the UI state. After the fresh diff lands
+    /// we re-anchor any saved review state for THIS comparison onto it (so
+    /// verdicts/comments survive a moving worktree), capturing hunks that no
+    /// longer appear as orphans. Then we re-persist (the diff may have shifted
+    /// every `@@` header, so the saved anchors/headers want refreshing).
     fn apply_diff_result(&mut self, res: Result<(String, Vec<ChangedFile>), String>) {
         match res {
-            Ok((branch, files)) => {
+            Ok((branch, mut files)) => {
                 self.branch = branch;
+                // Re-anchor saved state for the current comparison onto the
+                // fresh diff. Loads the per-comparison file (migrating the old
+                // single-file layout if needed); None = a fresh review.
+                let key = self.comparison_key();
+                if let Some(saved) =
+                    ReviewState::load_for_comparison(&self.state_root, &key)
+                {
+                    self.orphaned = saved.reanchor_onto(&mut files);
+                } else {
+                    self.orphaned = Vec::new();
+                }
                 self.files = files;
                 self.selected = if self.files.is_empty() {
                     None
                 } else {
                     Some(Selection::Changed(0))
                 };
+                // Persist the re-anchored state so the on-disk anchors/headers
+                // track the current diff and orphans are recorded — but only
+                // when there's actual review content (a verdict, comment, or
+                // orphan). A fresh comparison with no review yet writes nothing,
+                // so opening a repo never creates state files unprompted.
+                let has_review = !self.orphaned.is_empty()
+                    || self.files.iter().flat_map(|f| &f.hunks).any(|h| {
+                        h.status != ReviewStatus::Unreviewed || !h.comment.trim().is_empty()
+                    });
+                if has_review {
+                    self.save_review_state();
+                }
             }
             Err(e) => {
                 self.files.clear();
                 self.selected = None;
+                self.orphaned = Vec::new();
                 self.error = Some(e);
             }
         }
@@ -625,7 +670,14 @@ impl App {
                 }
                 s.push_str(&format!("### {}\n\n", f.path));
                 for h in matching {
-                    s.push_str(&format!("- `{}`\n", h.header.trim()));
+                    // Flag hunks whose verdict was carried over but whose
+                    // changed content has since moved/changed under it.
+                    let warn = if h.changed_since_review {
+                        " ⚠ changed since reviewed"
+                    } else {
+                        ""
+                    };
+                    s.push_str(&format!("- `{}`{warn}\n", h.header.trim()));
                     if !h.comment.trim().is_empty() {
                         for line in h.comment.trim().lines() {
                             s.push_str(&format!("  - {line}\n"));
@@ -641,14 +693,52 @@ impl App {
         let wrote_approved = section(&mut s, "Approved hunks", ReviewStatus::Approved);
         let wrote_unrev = section(&mut s, "Still unreviewed", ReviewStatus::Unreviewed);
 
-        if !wrote_rejected && !wrote_approved && !wrote_unrev {
+        // Stale: reviewed hunks whose anchor no longer appears in the diff (the
+        // changed code was removed/reverted). Preserved, not silently dropped.
+        let wrote_stale = !self.orphaned.is_empty();
+        if wrote_stale {
+            s.push_str("## Stale (no longer in diff)\n\n");
+            // Group orphans by file, preserving order.
+            let mut seen_files: Vec<&str> = Vec::new();
+            for o in &self.orphaned {
+                if !seen_files.contains(&o.file.as_str()) {
+                    seen_files.push(o.file.as_str());
+                }
+            }
+            for file in seen_files {
+                s.push_str(&format!("### {file}\n\n"));
+                for o in self.orphaned.iter().filter(|o| o.file == file) {
+                    s.push_str(&format!("- `{}` ({})\n", o.header.trim(), o.status));
+                    if let Some(c) = &o.comment {
+                        if !c.trim().is_empty() {
+                            for line in c.trim().lines() {
+                                s.push_str(&format!("  - {line}\n"));
+                            }
+                        }
+                    }
+                }
+                s.push('\n');
+            }
+        }
+
+        if !wrote_rejected && !wrote_approved && !wrote_unrev && !wrote_stale {
             s.push_str("No changes to review.\n");
         }
         s
     }
 
-    /// Serialize current review state to <repo>/.purview/review-state.json
-    /// so the MCP server can read it. Called whenever status changes.
+    /// Serialize the current review state for the active comparison. Persists
+    /// to TWO places, both routed through `RepoSource::persist_state` (so SSH
+    /// writes to the remote):
+    /// - `.purview/state/<key>.json` — the per-comparison file, the source of
+    ///   truth re-anchored on the next reload.
+    /// - `.purview/review-state.json` — the canonical mirror the MCP server
+    ///   reads (the live, active comparison). Kept identical so `purview-mcp`
+    ///   needs no changes.
+    ///
+    /// Each hunk's `anchor` (content hash) is computed here so it's recorded
+    /// alongside the `@@` header; orphans are carried through. Called whenever
+    /// status/comment changes.
     fn save_review_state(&self) {
         let range = match self.source {
             DiffSource::WorkingTree => "working tree vs HEAD".to_string(),
@@ -678,15 +768,21 @@ impl App {
                             } else {
                                 Some(h.comment.clone())
                             },
+                            anchor: h.content_anchor(),
+                            changed_since_review: h.changed_since_review,
                         })
                         .collect(),
                 })
                 .collect(),
+            orphaned: self.orphaned.clone(),
         };
-        // Persist WHERE the repo lives (remote over SSH, local fs otherwise)
-        // so the MCP server reads it natively. Serialize once, route through
-        // the backend.
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
+        // Persist WHERE the repo lives (remote over SSH, local fs otherwise) so
+        // the MCP server reads it natively. Serialize once, write to both the
+        // per-comparison file and the canonical mirror.
+        if let Ok(json) = state.to_json() {
+            let key = self.comparison_key();
+            let relname = format!("state/{}.json", key.file_stem());
+            let _ = self.repo.persist_state(&relname, &json);
             let _ = self.repo.persist_state("review-state.json", &json);
         }
     }
@@ -2295,6 +2391,9 @@ impl App {
             for (hunk_idx, status) in pending {
                 if let Some(h) = self.files[f].hunks.get_mut(hunk_idx) {
                     h.status = status;
+                    // The user just acted on this hunk → it's freshly reviewed,
+                    // so the "changed since reviewed" warning no longer applies.
+                    h.changed_since_review = false;
                 }
             }
             self.save_review_state();
@@ -2625,6 +2724,19 @@ impl App {
                         .monospace()
                         .color(Color32::from_rgb(120, 160, 220)),
                 );
+                // Warn when a carried-over verdict's content has changed since
+                // it was reviewed.
+                let changed_since = active_file
+                    .and_then(|f| self.files[f].hunks.get(hunk_idx))
+                    .map(|h| h.changed_since_review)
+                    .unwrap_or(false);
+                if changed_since {
+                    ui.label(
+                        egui::RichText::new("⚠ changed since reviewed")
+                            .small()
+                            .color(Color32::from_rgb(230, 180, 90)),
+                    );
+                }
             });
         });
     }
@@ -4761,6 +4873,126 @@ mod ui_tests {
         assert!(
             report.contains("looks good but consider edge case"),
             "a comment on an APPROVED hunk must appear (it used to be dropped):\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// END-TO-END durability: a verdict + comment survive a reload of the SAME
+    /// comparison via the re-anchor path (the feature's core promise). Approve
+    /// + comment, persist, reload, and confirm the verdict comes back — and it
+    /// is NOT flagged changed-since-review (the content was untouched).
+    #[test]
+    fn verdict_and_comment_survive_a_reload() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        app.poll_reload_blocking();
+        app.files[0].hunks[0].status = ReviewStatus::Approved;
+        app.files[0].hunks[0].comment = "keep this".to_string();
+        app.save_review_state();
+
+        // Reload the SAME comparison (working tree vs HEAD), recomputing the diff.
+        app.reload();
+        app.poll_reload_blocking();
+
+        assert_eq!(
+            app.files[0].hunks[0].status,
+            ReviewStatus::Approved,
+            "verdict must survive the reload via re-anchoring"
+        );
+        assert_eq!(app.files[0].hunks[0].comment, "keep this");
+        assert!(
+            !app.files[0].hunks[0].changed_since_review,
+            "unchanged content must not be flagged changed-since-review"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The canonical mirror (`review-state.json`) the MCP server reads is still
+    /// written and carries the new anchor field.
+    #[test]
+    fn mcp_mirror_still_written_with_anchor() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        app.poll_reload_blocking();
+        app.files[0].hunks[0].status = ReviewStatus::Approved;
+        app.save_review_state();
+
+        let state = ReviewState::load(&repo).expect("canonical mirror written for MCP");
+        let h = state.files.iter().flat_map(|f| &f.hunks).next().unwrap();
+        assert_eq!(h.status, "approved");
+        assert!(!h.anchor.is_empty(), "the mirror records the content anchor");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Report renders the "⚠ changed since reviewed" marker when a hunk's
+    /// content changed under a carried-over verdict.
+    #[test]
+    fn report_marks_changed_since_reviewed() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        app.poll_reload_blocking();
+        app.files[0].hunks[0].status = ReviewStatus::Rejected;
+        app.files[0].hunks[0].comment = "needs work".to_string();
+        app.files[0].hunks[0].changed_since_review = true;
+
+        let report = app.review_report();
+        assert!(
+            report.contains("⚠ changed since reviewed"),
+            "report must flag a changed-since-reviewed hunk:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Report renders the "Stale (no longer in diff)" section for orphaned
+    /// reviewed hunks.
+    #[test]
+    fn report_shows_stale_section_for_orphans() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        app.poll_reload_blocking();
+        app.orphaned = vec![purview::review_state::OrphanedHunk {
+            file: "gone.rs".into(),
+            header: "@@ -1,2 +1,2 @@".into(),
+            status: "rejected".into(),
+            comment: Some("this was removed".into()),
+            anchor: "deadbeef".into(),
+        }];
+
+        let report = app.review_report();
+        assert!(
+            report.contains("## Stale (no longer in diff)"),
+            "report must have a Stale section:\n{report}"
+        );
+        assert!(report.contains("gone.rs"), "stale file listed:\n{report}");
+        assert!(
+            report.contains("this was removed"),
+            "stale comment preserved:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A reviewed hunk that vanishes from the diff after a reload is moved into
+    /// `app.orphaned` (not silently dropped). Edit the file so the original
+    /// change is reverted, reload, and confirm the verdict surfaces as stale.
+    #[test]
+    fn vanished_hunk_becomes_orphaned_on_reload() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        app.poll_reload_blocking();
+        // Reject + comment the fixture's change.
+        app.files[0].hunks[0].status = ReviewStatus::Rejected;
+        app.files[0].hunks[0].comment = "revert this".to_string();
+        app.save_review_state();
+
+        // Revert the working-tree edit so the diff is now empty for a.txt.
+        std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        app.reload();
+        app.poll_reload_blocking();
+
+        assert!(
+            app.orphaned.iter().any(|o| o.comment.as_deref() == Some("revert this")),
+            "a reviewed hunk that left the diff must be preserved as orphaned, got {:?}",
+            app.orphaned
         );
         let _ = std::fs::remove_dir_all(&repo);
     }

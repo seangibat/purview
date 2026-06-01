@@ -189,6 +189,9 @@ fn call_tool(
                     file: file.to_string(),
                     hunk_header: hunk_header.to_string(),
                     text: text.to_string(),
+                    // The MCP server identifies the hunk by header only; the GUI
+                    // re-anchors replies by header when the anchor is empty.
+                    anchor: String::new(),
                 },
             ) {
                 Ok(()) => "reply posted".to_string(),

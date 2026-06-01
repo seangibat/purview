@@ -262,6 +262,10 @@ impl RepoSource for LocalRepo {
         let dir = crate::review_state::ensure_purview_dir(&self.root)
             .map_err(|e| e.to_string())?;
         let path = dir.join(relname);
+        // `relname` may contain a subdir (e.g. `state/<key>.json`); create it.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         let tmp = path.with_extension("purview-tmp");
         std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())

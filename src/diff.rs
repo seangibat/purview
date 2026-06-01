@@ -47,6 +47,11 @@ pub struct Hunk {
     pub rows: Vec<DiffLineRow>,
     pub status: ReviewStatus,
     pub comment: String,
+    /// True when a saved verdict/comment was carried onto this freshly-parsed
+    /// hunk but the changed content differs from what was reviewed (the region
+    /// still matches, the +/- lines don't). Surfaced as "⚠ changed since
+    /// reviewed" in the UI + report. Reset to false on a clean anchor match.
+    pub changed_since_review: bool,
 }
 
 impl Hunk {
@@ -56,6 +61,7 @@ impl Hunk {
             rows: Vec::new(),
             status: ReviewStatus::Unreviewed,
             comment: String::new(),
+            changed_since_review: false,
         }
     }
 
@@ -89,6 +95,77 @@ impl Hunk {
             }
         }
     }
+
+    /// A stable identity for this hunk based on its CONTENT, not its `@@`
+    /// line numbers. Used to re-anchor saved review verdicts/comments onto a
+    /// freshly-recomputed diff after the worktree moves under the reviewer (so
+    /// the same changed code keeps its verdict even when its line offset
+    /// shifts).
+    ///
+    /// The hash covers, each row normalized by trimming trailing whitespace:
+    /// - up to 2 leading context rows (immediately before the first change),
+    /// - every changed (+/-) row in document order, tagged `+`/`-`,
+    /// - up to 2 trailing context rows (immediately after the last change).
+    ///
+    /// Line numbers are deliberately excluded, so the SAME changed content at a
+    /// different file offset hashes identically, while different changed content
+    /// produces a different anchor. The same function runs at save time and at
+    /// re-anchor time, so the two hashes are computed identically.
+    pub fn content_anchor(&self) -> String {
+        content_anchor_for_rows(&self.rows)
+    }
+}
+
+/// Shared anchor computation over a row slice (see [`Hunk::content_anchor`]).
+/// Pulled out so it can be unit-tested directly and reused from the
+/// re-anchoring path.
+pub fn content_anchor_for_rows(rows: &[DiffLineRow]) -> String {
+    use std::hash::{Hash, Hasher};
+
+    // The span of changed rows: from the first +/- to the last +/-.
+    let first = rows.iter().position(|r| r.kind != LineKind::Ctx);
+    let last = rows.iter().rposition(|r| r.kind != LineKind::Ctx);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    let norm = |s: &str| s.trim_end().to_string();
+
+    match (first, last) {
+        (Some(first), Some(last)) => {
+            // Up to 2 leading context rows immediately before the first change.
+            let lead_start = first.saturating_sub(2);
+            for r in &rows[lead_start..first] {
+                "ctx".hash(&mut hasher);
+                norm(&r.text).hash(&mut hasher);
+            }
+            // Every changed row in the change span, tagged by side. (Context
+            // rows interleaved within the span are included too, tagged ctx, so
+            // a change that merely moves a context line still differs.)
+            for r in &rows[first..=last] {
+                let tag = match r.kind {
+                    LineKind::Add => "+",
+                    LineKind::Del => "-",
+                    LineKind::Ctx => "ctx",
+                };
+                tag.hash(&mut hasher);
+                norm(&r.text).hash(&mut hasher);
+            }
+            // Up to 2 trailing context rows immediately after the last change.
+            let trail_end = (last + 3).min(rows.len());
+            for r in &rows[last + 1..trail_end] {
+                "ctx".hash(&mut hasher);
+                norm(&r.text).hash(&mut hasher);
+            }
+        }
+        // No changed rows (a pure-context or empty hunk): hash all rows so two
+        // such hunks with different content still differ, but it has no real
+        // anchor identity (callers fall back to the @@ header for these).
+        _ => {
+            for r in rows {
+                norm(&r.text).hash(&mut hasher);
+            }
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 /// Parse the old/new starting line numbers from a hunk header of the form
@@ -543,5 +620,60 @@ diff --git a/g.txt b/g.txt
         assert_eq!(f.progress(), (0, 2));
         f.hunks[0].status = ReviewStatus::Approved;
         assert_eq!(f.progress(), (1, 2));
+    }
+
+    /// Build a single-file patch and return its first hunk, for anchor tests.
+    fn hunk_from_patch(patch: &str) -> Hunk {
+        let files = parse_unified_patch(patch);
+        files.into_iter().next().unwrap().hunks.into_iter().next().unwrap()
+    }
+
+    /// The SAME changed content at a DIFFERENT file offset hashes identically:
+    /// the anchor excludes the `@@` line numbers, so a worktree moving the hunk
+    /// up/down the file (without touching the change) keeps the same anchor.
+    #[test]
+    fn content_anchor_is_stable_across_line_number_shifts() {
+        let at_top = hunk_from_patch(
+            "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -10,5 +10,5 @@\n ctx_before\n ctx2\n-old line\n+new line\n ctx_after\n",
+        );
+        // Identical content + context, but the hunk now sits at line 200.
+        let shifted = hunk_from_patch(
+            "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -200,5 +205,5 @@\n ctx_before\n ctx2\n-old line\n+new line\n ctx_after\n",
+        );
+        assert_eq!(
+            at_top.content_anchor(),
+            shifted.content_anchor(),
+            "anchor must ignore line numbers — same change, different offset"
+        );
+    }
+
+    /// Different changed content → different anchor (so a real edit to the
+    /// reviewed code is detected, not silently re-approved).
+    #[test]
+    fn content_anchor_differs_when_changed_content_differs() {
+        let a = hunk_from_patch(
+            "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -10,4 +10,4 @@\n ctx\n-old line\n+new line\n ctx2\n",
+        );
+        let b = hunk_from_patch(
+            "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -10,4 +10,4 @@\n ctx\n-old line\n+DIFFERENT new line\n ctx2\n",
+        );
+        assert_ne!(
+            a.content_anchor(),
+            b.content_anchor(),
+            "a different replacement line must change the anchor"
+        );
+    }
+
+    /// Trailing whitespace on a changed line is normalized away (so a reflow
+    /// that only adds/removes trailing space doesn't orphan the verdict).
+    #[test]
+    fn content_anchor_ignores_trailing_whitespace() {
+        let a = hunk_from_patch(
+            "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n",
+        );
+        let b = hunk_from_patch(
+            "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n ctx  \n-old\t\n+new   \n",
+        );
+        assert_eq!(a.content_anchor(), b.content_anchor());
     }
 }

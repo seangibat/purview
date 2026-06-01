@@ -516,13 +516,24 @@ impl RepoSource for SshRepo {
         // user's git status.
         let purview = format!("{}/.purview", self.target.path);
         let qdir = shell_quote(&purview);
-        let dst = shell_quote(&format!("{purview}/{relname}"));
-        let tmp = shell_quote(&format!("{purview}/{relname}.purview.tmp"));
+        let dst_path = format!("{purview}/{relname}");
+        let dst = shell_quote(&dst_path);
+        let tmp = shell_quote(&format!("{dst_path}.purview.tmp"));
         let gi = shell_quote(&format!("{purview}/.gitignore"));
+        // `relname` may contain a subdir (e.g. `state/<key>.json`); make the
+        // destination's parent dir too. `dirname` of the dst handles both the
+        // flat and nested cases.
+        let dst_dir = shell_quote(
+            std::path::Path::new(&dst_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| purview.clone())
+                .as_str(),
+        );
         // Note the doubled braces: the `{ ...; }` shell group is a literal in
         // the output, not a format placeholder.
         let remote_cmd = format!(
-            "mkdir -p {qdir} && \
+            "mkdir -p {qdir} && mkdir -p {dst_dir} && \
              {{ [ -f {gi} ] || printf '*\\n' > {gi}; }} && \
              cat > {tmp} && mv {tmp} {dst}"
         );
@@ -533,6 +544,9 @@ impl RepoSource for SshRepo {
         // matters, so a local-mirror failure shouldn't fail the action.
         if let Ok(dir) = crate::review_state::ensure_purview_dir(&self.state_root) {
             let path = dir.join(relname);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let tmp = path.with_extension("purview-tmp");
             if std::fs::write(&tmp, contents).is_ok() {
                 let _ = std::fs::rename(&tmp, &path);
