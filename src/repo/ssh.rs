@@ -491,6 +491,12 @@ impl RepoSource for SshRepo {
         true
     }
 
+    fn is_remote(&self) -> bool {
+        // Every read is a blocking remote round-trip — load file content off the
+        // UI thread (Task A) so a click never freezes the app.
+        true
+    }
+
     fn label(&self) -> String {
         format!("ssh://{}{}", self.target.host, self.target.path)
     }

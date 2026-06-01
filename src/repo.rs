@@ -115,6 +115,14 @@ pub trait RepoSource: Send + Sync {
         true
     }
 
+    /// Whether reads from this backend are slow enough to warrant loading file
+    /// content off the UI thread. The local fs is fast → load synchronously
+    /// (instant, no spinner). SSH does blocking remote round-trips → load async.
+    /// Drives Task A's sync-vs-async file-open path.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     /// A short human label for the repo (shown in the title bar).
     fn label(&self) -> String;
 

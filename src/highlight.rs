@@ -104,9 +104,72 @@ impl Highlighter {
     }
 }
 
+/// The dark background purview renders the content pane against. `base16-mocha`
+/// is very dark, so its lower-luminance scopes (some punctuation, comments —
+/// the closing-paren the user noticed) come out nearly invisible. We floor every
+/// token color's luminance against THIS bg so nothing renders illegibly dark
+/// (see [`ensure_contrast`]).
+const DARK_BG: Color32 = Color32::from_rgb(24, 24, 24);
+
 fn to_color(style: Style) -> Color32 {
     let c = style.foreground;
-    Color32::from_rgb(c.r, c.g, c.b)
+    ensure_contrast(Color32::from_rgb(c.r, c.g, c.b), DARK_BG)
+}
+
+/// Relative luminance (WCAG sRGB) of a color in 0.0..=1.0. Used as the
+/// perceived-brightness measure for the contrast floor.
+fn relative_luminance(c: Color32) -> f32 {
+    fn lin(ch: u8) -> f32 {
+        let s = ch as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// Lighten `fg` only if it's too dark to read against `bg`, preserving its hue.
+///
+/// A general fix for ALL low-contrast tokens (not just parens): if `fg`'s
+/// luminance is below a floor relative to the background, blend it toward white
+/// just enough to clear the floor; colors already bright enough are returned
+/// UNCHANGED, so the palette isn't washed out. Hue is preserved because we
+/// interpolate each channel toward white by the same factor (a tint), which
+/// keeps the ratios between channels roughly intact while raising lightness.
+fn ensure_contrast(fg: Color32, bg: Color32) -> Color32 {
+    // Minimum acceptable foreground luminance above the background's. Tuned so
+    // near-black tokens on the ~0.01-luminance mocha bg get lifted to a clearly
+    // readable mid-gray, while anything already legible is left alone.
+    const FLOOR: f32 = 0.18;
+    let bg_lum = relative_luminance(bg);
+    let fg_lum = relative_luminance(fg);
+    let target = bg_lum + FLOOR;
+    if fg_lum >= target {
+        return fg; // already bright enough — don't touch it.
+    }
+    // Blend fg toward white by a factor `t` (a tint: each channel moves the same
+    // fraction toward 255, so hue is preserved). Luminance is NON-linear in `t`
+    // because of sRGB gamma, so we can't solve for `t` in closed form — we
+    // binary-search the smallest `t` whose tinted color clears the floor. ~24
+    // iterations is exact to well under one 8-bit step.
+    let tint = |t: f32| -> Color32 {
+        let mix = |ch: u8| -> u8 {
+            (ch as f32 + t * (255.0 - ch as f32)).round().clamp(0.0, 255.0) as u8
+        };
+        Color32::from_rgb(mix(fg.r()), mix(fg.g()), mix(fg.b()))
+    };
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if relative_luminance(tint(mid)) >= target {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    tint(hi)
 }
 
 #[cfg(test)]
@@ -137,6 +200,52 @@ mod tests {
             .collect();
 
         assert_eq!(incremental, reference, "incremental must equal stateful");
+    }
+
+    /// A near-black token against the dark bg must be lifted above the
+    /// luminance floor so it's legible — the general fix for low-contrast
+    /// punctuation (the closing-paren the user noticed).
+    #[test]
+    fn ensure_contrast_lifts_near_black_token() {
+        let near_black = Color32::from_rgb(10, 10, 12);
+        let lifted = ensure_contrast(near_black, DARK_BG);
+        assert_ne!(lifted, near_black, "a near-black token must be lightened");
+        let lum = relative_luminance(lifted);
+        assert!(
+            lum >= relative_luminance(DARK_BG) + 0.18 - 1e-3,
+            "lifted luminance {lum} must clear the contrast floor"
+        );
+        // Each channel only ever moves toward white (lighter), never darker.
+        assert!(lifted.r() >= near_black.r());
+        assert!(lifted.g() >= near_black.g());
+        assert!(lifted.b() >= near_black.b());
+    }
+
+    /// An already-bright color is returned UNCHANGED — the floor only lifts
+    /// genuinely dark tokens, it doesn't wash out the palette.
+    #[test]
+    fn ensure_contrast_leaves_bright_color_unchanged() {
+        let bright = Color32::from_rgb(220, 200, 120); // a normal syntax color
+        assert_eq!(
+            ensure_contrast(bright, DARK_BG),
+            bright,
+            "a bright, legible color must pass through untouched"
+        );
+        // White is trivially unchanged too.
+        assert_eq!(ensure_contrast(Color32::WHITE, DARK_BG), Color32::WHITE);
+    }
+
+    /// Hue is roughly preserved: a dark-but-saturated token stays recognizably
+    /// the same hue after lifting (we tint toward white, not recolor). The
+    /// dominant channel before stays the dominant channel after.
+    #[test]
+    fn ensure_contrast_preserves_hue_ordering() {
+        let dark_blue = Color32::from_rgb(10, 20, 60); // blue-dominant
+        let lifted = ensure_contrast(dark_blue, DARK_BG);
+        assert!(
+            lifted.b() >= lifted.r() && lifted.b() >= lifted.g(),
+            "blue should remain the dominant channel after lifting: {lifted:?}"
+        );
     }
 
     #[test]

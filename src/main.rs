@@ -163,6 +163,96 @@ enum RenderRow {
     },
 }
 
+/// What kind of remote payload a content load fetches, keyed in the cache so a
+/// re-open is instant. The two expensive (over SSH, blocking) fetches
+/// `ensure_cache` would otherwise do on the UI thread:
+/// - `Full`: a tree-opened file's whole contents (`read_file`).
+/// - `FullHunks`: a changed file's full-context re-diff (`compute_file_diff`),
+///   shown in Full extent.
+/// (Summary extent reuses the already-computed `self.files` hunks — no fetch.)
+#[derive(Clone)]
+enum FileContent {
+    /// Whole-file text for a tree-opened `Selection::Path`.
+    Full(String),
+    /// Full-context diff hunks for a `Selection::Changed` in `Extent::Full`.
+    FullHunks(Vec<diff::Hunk>),
+}
+
+/// Identity of a loaded payload. Re-opening the SAME (path, what-we-fetch)
+/// returns the cached `FileContent` with no backend round-trip. `source`/`base`
+/// are part of the key because changing the diff base must refetch; `generation`
+/// is NOT — the cache is cleared wholesale on reload()/refresh instead, so a
+/// stale diff can never be served (see `invalidate_content_cache`).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ContentKey {
+    path: String,
+    /// True for a `compute_file_diff` (Full extent) load, false for a whole-file
+    /// `read_file` (tree-opened) load — the two never collide on path alone.
+    full_diff: bool,
+    source: DiffSource,
+    base: String,
+}
+
+/// A bounded in-memory cache of loaded file content. Keeps the last `cap`
+/// distinct keys (simple FIFO eviction — recency of *insertion*, which for this
+/// access pattern, opening files one at a time, tracks "last N files"). Cleared
+/// wholesale when the diff changes.
+struct ContentCache {
+    cap: usize,
+    map: std::collections::HashMap<ContentKey, FileContent>,
+    /// Insertion order, oldest first, for eviction.
+    order: std::collections::VecDeque<ContentKey>,
+}
+
+impl ContentCache {
+    fn new(cap: usize) -> Self {
+        ContentCache {
+            cap,
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &ContentKey) -> Option<&FileContent> {
+        self.map.get(key)
+    }
+
+    /// Insert a loaded payload, evicting the oldest entry if over capacity.
+    /// Re-inserting an existing key just refreshes its value (no dup in order).
+    fn insert(&mut self, key: ContentKey, val: FileContent) {
+        if self.map.insert(key.clone(), val).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
+/// Run the (possibly blocking, over SSH) backend fetch for `key`. Pure w.r.t.
+/// the App — takes only the backend — so it runs on a worker thread and is
+/// directly unit-testable. Mirrors what `ensure_cache` used to do inline.
+fn fetch_content(repo: &dyn RepoSource, key: &ContentKey) -> Result<FileContent, String> {
+    if key.full_diff {
+        let (_, mut files) = repo.compute_file_diff(key.source, &key.base, u32::MAX, &key.path)?;
+        let hunks = files
+            .iter()
+            .position(|f| f.path == key.path)
+            .map(|i| std::mem::take(&mut files[i].hunks))
+            .unwrap_or_default();
+        Ok(FileContent::FullHunks(hunks))
+    } else {
+        repo.read_file(&key.path).map(FileContent::Full)
+    }
+}
+
 struct App {
     /// Repo backend — local (git2 + fs) or SSH. The UI only talks to this.
     repo: std::sync::Arc<dyn RepoSource>,
@@ -246,6 +336,25 @@ struct App {
     diff_rx: Option<std::sync::mpsc::Receiver<(u64, Result<(String, Vec<ChangedFile>), String>)>>,
     /// True while `diff_rx` is in flight — drives the "loading…" UI + spinner.
     loading: bool,
+    /// Bounded cache of loaded file content (Task A): re-opening an already-
+    /// loaded file is instant, no backend round-trip. Cleared on reload/refresh.
+    content_cache: ContentCache,
+    /// In-flight async file-content load (Task A). Over SSH, opening a file is a
+    /// blocking remote round-trip (`compute_file_diff`/`read_file`); doing it in
+    /// `ensure_cache` froze the UI ~1s per click. We instead kick the fetch onto
+    /// a worker thread, show a "loading…" pane, and apply the result in `ui` via
+    /// `poll_content`. The worker stamps each result with the load-`generation`
+    /// it was started for; a newer open supersedes an older in-flight load (the
+    /// generation guard, mirroring `diff_rx`). `Some` = a content load is
+    /// in flight; the inner key is what's being fetched (so a duplicate kick for
+    /// the same key is suppressed).
+    content_rx: Option<(ContentKey, std::sync::mpsc::Receiver<(u64, ContentKey, Result<FileContent, String>)>)>,
+    /// Bumped on every content load kicked off, so a stale result (from a load
+    /// superseded by a faster file switch) is dropped instead of applied.
+    content_gen: u64,
+    /// True while `content_rx` is in flight — drives the content pane's
+    /// "loading…" placeholder so a slow open never freezes the frame.
+    content_loading: bool,
     /// Whether the `?` keybinding cheat-sheet overlay is showing.
     show_help: bool,
     /// In-file (Ctrl+F) search state. Some = the search bar is open.
@@ -309,6 +418,13 @@ impl App {
             editing: None,
             diff_rx: None,
             loading: false,
+            // Keep the last ~16 opened files' content in memory — plenty to make
+            // j/k navigation and revisits instant, bounded so it can't grow without
+            // limit on a long review session.
+            content_cache: ContentCache::new(16),
+            content_rx: None,
+            content_gen: 0,
+            content_loading: false,
             show_help: false,
             search: None,
             last_open_path: None,
@@ -348,6 +464,9 @@ impl App {
         self.report_note.clear();
         self.cache.clear();
         self.cache_key = None;
+        // The diff changed — any loaded file content (full-file re-diffs,
+        // tree-file reads) may now be stale (Task A).
+        self.invalidate_content_cache();
         self.generation = self.generation.wrapping_add(1);
         let gen = self.generation;
 
@@ -569,18 +688,101 @@ impl App {
         Ok(self.state_root.join(".purview").join("review-report.md"))
     }
 
-    /// Read the full current (working/new side) contents of `rel` via the repo
-    /// backend (local fs or remote cat).
-    fn read_full_file(&self, rel: &str) -> Result<String, String> {
-        self.repo.read_file(rel)
-    }
-
     /// Write `new_text` to the file's line `line0` (0-based), preserving the
     /// rest. Only valid in full-file (Plain) view, where cache row == file
     /// line. Routed through the repo backend (no-op/error in ssh mode).
     fn write_line(&self, rel: &str, line0: usize, new_text: &str) -> Result<(), String> {
         self.repo.write_line(rel, line0, new_text)
     }
+
+    /// The content payload a selection+view needs fetched from the backend, if
+    /// any. `None` means everything needed is already in hand (Summary extent
+    /// reuses `self.files` hunks — no fetch) so `ensure_cache` can build
+    /// synchronously. `Some(key)` is a (possibly slow, over SSH) load that goes
+    /// through the cache + async loader.
+    fn content_key_for(&self, sel: &Selection) -> Option<ContentKey> {
+        match sel {
+            Selection::Changed(idx) => {
+                if self.extent == Extent::Full {
+                    let path = self.files.get(*idx)?.path.clone();
+                    Some(ContentKey {
+                        path,
+                        full_diff: true,
+                        source: self.source,
+                        base: self.base.clone(),
+                    })
+                } else {
+                    None // Summary: reuse already-computed hunks.
+                }
+            }
+            Selection::Path(p) => Some(ContentKey {
+                path: p.clone(),
+                full_diff: false,
+                source: self.source,
+                base: self.base.clone(),
+            }),
+        }
+    }
+
+    /// Kick a file-content load onto a worker thread (Task A). Mirrors the diff
+    /// `reload` pattern: bump a load generation, stash a Receiver, and let
+    /// `poll_content` apply the result — dropping any stamped with a superseded
+    /// generation (the user switched files faster than the load finished). A
+    /// load already in flight for the SAME key is left alone (no duplicate kick).
+    fn kick_content_load(&mut self, key: ContentKey) {
+        if self.content_rx.as_ref().map(|(k, _)| k) == Some(&key) {
+            return; // already loading exactly this.
+        }
+        self.content_gen = self.content_gen.wrapping_add(1);
+        let gen = self.content_gen;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = std::sync::Arc::clone(&self.repo);
+        let kc = key.clone();
+        std::thread::spawn(move || {
+            let res = fetch_content(repo.as_ref(), &kc);
+            let _ = tx.send((gen, kc, res));
+        });
+        self.content_rx = Some((key, rx));
+        self.content_loading = true;
+    }
+
+    /// Non-blocking poll for an in-flight content load (Task A). Applies a
+    /// finished payload to the cache IFF its generation is current (a newer
+    /// open supersedes an older load). Returns true if a current-generation
+    /// result landed this call (so the caller rebuilds the cache from it).
+    fn poll_content(&mut self) -> bool {
+        let want = self.content_gen;
+        let Some((_, rx)) = &self.content_rx else { return false };
+        let Ok((gen, key, res)) = rx.try_recv() else { return false };
+        if gen != want {
+            // Superseded — drop it; a newer load is in flight (keep loading).
+            return false;
+        }
+        self.content_rx = None;
+        self.content_loading = false;
+        match res {
+            Ok(content) => {
+                self.content_cache.insert(key, content);
+                // Force ensure_cache to rebuild now that the payload is in hand.
+                self.cache_key = None;
+                true
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.cache_key = None;
+                true
+            }
+        }
+    }
+
+    /// Drop all cached file content (Task A). Called on reload()/refresh because
+    /// the diff changed — a previously-loaded payload may now be stale.
+    fn invalidate_content_cache(&mut self) {
+        self.content_cache.clear();
+        self.content_rx = None;
+        self.content_loading = false;
+    }
+
 
     /// Rebuild the (raw, un-highlighted) render cache if selection/view
     /// changed. Highlighting happens lazily per visible row at draw time —
@@ -596,6 +798,31 @@ impl App {
         let key = (self.generation, sel.clone(), self.layout, self.extent);
         if self.cache_key.as_ref() == Some(&key) {
             return;
+        }
+
+        // Task A: does this selection/view need a (possibly slow) backend fetch
+        // that isn't already cached? If so, serve it from the cache when present
+        // — instant, no round-trip — or load it: synchronously for the local fs
+        // (fast), asynchronously for SSH (a blocking remote round-trip that used
+        // to freeze the UI ~1s per click). While an async load is in flight we
+        // leave the render cache empty and bail; the content pane shows a
+        // "loading…" placeholder and `poll_content` rebuilds when it lands.
+        if let Some(ck) = self.content_key_for(&sel) {
+            if self.content_cache.get(&ck).is_none() {
+                if self.repo.is_remote() {
+                    self.kick_content_load(ck);
+                    // Don't build the cache yet — wait for the payload.
+                    self.cache.clear();
+                    self.hl_cache.borrow_mut().clear();
+                    return;
+                } else {
+                    // Local fs: load inline (instant) and cache it.
+                    match fetch_content(self.repo.as_ref(), &ck) {
+                        Ok(content) => self.content_cache.insert(ck.clone(), content),
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+            }
         }
 
         let mut out: Vec<RenderRow> = Vec::new();
@@ -618,17 +845,20 @@ impl App {
                     // control strip into the full flow at each review hunk's
                     // change region, so approve/reject targets that exact hunk
                     // in place as the user scrolls.
-                    let full_hunks: Vec<diff::Hunk> = self
-                        .repo
-                        .compute_file_diff(self.source, &self.base, u32::MAX, &path)
-                        .ok()
-                        .and_then(|(_, mut files)| {
-                            files
-                                .iter()
-                                .position(|f| f.path == path)
-                                .map(|i| std::mem::take(&mut files[i].hunks))
-                        })
-                        .unwrap_or_else(|| self.files[*idx].hunks.clone());
+                    // The full-context hunks come from the content cache (loaded
+                    // sync for local / async for SSH above), so this build does
+                    // no backend round-trip. Fall back to the Summary hunks if
+                    // the load failed.
+                    let ck = ContentKey {
+                        path: path.clone(),
+                        full_diff: true,
+                        source: self.source,
+                        base: self.base.clone(),
+                    };
+                    let full_hunks: Vec<diff::Hunk> = match self.content_cache.get(&ck) {
+                        Some(FileContent::FullHunks(h)) => h.clone(),
+                        _ => self.files[*idx].hunks.clone(),
+                    };
                     // The review hunks (what Summary shows) and the line-number
                     // key at which each one's change region begins.
                     let review = &self.files[*idx].hunks;
@@ -719,11 +949,19 @@ impl App {
                 }
             }
             Selection::Path(p) => {
-                // Unchanged file from the tree — just show it whole.
+                // Unchanged file from the tree — just show it whole. Its
+                // contents come from the content cache (loaded sync for local /
+                // async for SSH above), so this build does no backend round-trip.
                 path = p.clone();
                 plain = true;
-                match self.read_full_file(&path) {
-                    Ok(content) => {
+                let ck = ContentKey {
+                    path: path.clone(),
+                    full_diff: false,
+                    source: self.source,
+                    base: self.base.clone(),
+                };
+                match self.content_cache.get(&ck) {
+                    Some(FileContent::Full(content)) => {
                         for (i, line) in content.lines().enumerate() {
                             out.push(RenderRow::Plain {
                                 text: line.to_string(),
@@ -731,8 +969,11 @@ impl App {
                             });
                         }
                     }
-                    Err(e) => out.push(RenderRow::Plain {
-                        text: format!("cannot read file: {e}"),
+                    _ => out.push(RenderRow::Plain {
+                        text: format!(
+                            "cannot read file: {}",
+                            self.error.as_deref().unwrap_or("load failed")
+                        ),
                         lineno: 1,
                     }),
                 }
@@ -1407,7 +1648,11 @@ impl App {
         // flight, keep repainting so the poll runs and the spinner animates —
         // the worker thread can't wake egui on its own.
         self.poll_reload();
-        if self.loading {
+        // Task A: pick up an async file-content load if it finished. While one
+        // is in flight, keep repainting so the poll runs and the "loading…"
+        // placeholder animates — the worker can't wake egui on its own.
+        self.poll_content();
+        if self.loading || self.content_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -1771,6 +2016,18 @@ impl App {
                 });
                 return;
             }
+            // Task A: a file open is loading over SSH — show a brief placeholder
+            // instead of a frozen frame. The cache is empty until the payload
+            // lands (then `poll_content` rebuilds it).
+            if self.content_loading {
+                ui.centered_and_justified(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label("loading…");
+                    });
+                });
+                return;
+            }
             if self.selected.is_none() {
                 let msg = if self.error.is_some() {
                     "diff failed — see the error above"
@@ -2081,7 +2338,10 @@ impl App {
                 match self.write_line(&path, row, &new_text) {
                     Ok(()) => {
                         self.report_note = format!("edited {path}:{}", row + 1);
-                        self.cache_key = None; // force re-read of the file
+                        // The file on disk changed — drop cached content so the
+                        // rebuild re-reads it (Task A cache), and the render cache.
+                        self.invalidate_content_cache();
+                        self.cache_key = None;
                     }
                     Err(e) => self.report_note = format!("edit failed: {e}"),
                 }
@@ -3895,6 +4155,136 @@ mod ui_tests {
         harness.press_key(egui::Key::Escape);
         harness.run();
         assert!(harness.state().search.is_none(), "Esc closes the search bar");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A backend that COUNTS its `read_file` calls, so we can prove the
+    /// file-open content cache (Task A) doesn't refetch a file it already
+    /// loaded. Everything else is a stub — only the read path matters here.
+    /// `is_remote()` is false so loads go through the synchronous local path
+    /// (deterministic, no thread/poll dance needed for the cache-hit assertion).
+    struct CountingRepo {
+        root: PathBuf,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl purview::repo::RepoSource for CountingRepo {
+        fn compute_diff(
+            &self,
+            _s: DiffSource,
+            _b: &str,
+        ) -> Result<(String, Vec<ChangedFile>), String> {
+            Ok(("main".to_string(), Vec::new()))
+        }
+        fn compute_file_diff(
+            &self,
+            _s: DiffSource,
+            _b: &str,
+            _c: u32,
+            _p: &str,
+        ) -> Result<(String, Vec<ChangedFile>), String> {
+            Ok(("main".to_string(), Vec::new()))
+        }
+        fn read_file(&self, _rel: &str) -> Result<String, String> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("alpha\nbeta\ngamma\n".to_string())
+        }
+        fn list_dir(&self, _rel: &str) -> Result<Vec<purview::repo::DirEntry>, String> {
+            Ok(Vec::new())
+        }
+        fn list_all_files(&self, _cap: usize) -> (Vec<String>, bool) {
+            (Vec::new(), false)
+        }
+        fn guess_default_base(&self) -> String {
+            "main".to_string()
+        }
+        fn write_line(&self, _r: &str, _l: usize, _t: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn grep_symbol(&self, _s: &str) -> Result<Vec<purview::gotodef::Candidate>, String> {
+            Ok(Vec::new())
+        }
+        fn label(&self) -> String {
+            "counting".to_string()
+        }
+        fn state_root(&self) -> &std::path::Path {
+            &self.root
+        }
+        fn persist_state(&self, _n: &str, _c: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Opening the same tree file twice hits the content cache the second time:
+    /// the backend `read_file` is called exactly ONCE across two opens (Task A).
+    #[test]
+    fn opening_same_file_twice_does_not_refetch() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repo = CountingRepo {
+            root: std::env::temp_dir(),
+            reads: std::sync::Arc::clone(&reads),
+        };
+        let mut app = App::new(Box::new(repo));
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // First open of a tree file → one read, payload cached.
+        app.selected = Some(Selection::Path("foo.txt".to_string()));
+        app.ensure_cache();
+        assert_eq!(reads.load(SeqCst), 1, "first open should fetch once");
+        assert!(!app.cache.is_empty(), "content should be rendered after load");
+
+        // Switch away, then re-open the SAME file → served from cache, no refetch.
+        app.selected = Some(Selection::Path("other.txt".to_string()));
+        app.ensure_cache();
+        assert_eq!(reads.load(SeqCst), 2, "a different file fetches once more");
+        app.selected = Some(Selection::Path("foo.txt".to_string()));
+        app.ensure_cache();
+        assert_eq!(
+            reads.load(SeqCst),
+            2,
+            "re-opening a cached file must NOT refetch the backend"
+        );
+
+        // A reload invalidates the cache → the next open refetches.
+        app.invalidate_content_cache();
+        app.cache_key = None;
+        app.selected = Some(Selection::Path("foo.txt".to_string()));
+        app.ensure_cache();
+        assert_eq!(
+            reads.load(SeqCst),
+            3,
+            "after invalidation the file is fetched again"
+        );
+    }
+
+    /// The async file-load generation guard (Task A), tested directly like
+    /// `stale_reload_result_is_ignored`: a result stamped with a superseded
+    /// content generation must be dropped by `poll_content`, never applied.
+    #[test]
+    fn stale_content_load_result_is_ignored() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        // Simulate: a content load was in flight (content_gen G), then a faster
+        // file switch bumped content_gen. A late result for G arrives.
+        let stale_gen = app.content_gen;
+        app.content_gen = app.content_gen.wrapping_add(1); // superseded
+        let key = ContentKey {
+            path: "stale.txt".to_string(),
+            full_diff: false,
+            source: DiffSource::WorkingTree,
+            base: "main".to_string(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((stale_gen, key.clone(), Ok(FileContent::Full("STALE".to_string()))))
+            .unwrap();
+        app.content_rx = Some((key.clone(), rx));
+        app.content_loading = true;
+        let applied = app.poll_content();
+        assert!(!applied, "a superseded content result must not be applied");
+        assert!(
+            app.content_cache.get(&key).is_none(),
+            "stale content must not leak into the cache"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 

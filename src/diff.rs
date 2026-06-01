@@ -125,7 +125,7 @@ impl ChangedFile {
 }
 
 /// What we diff against.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DiffSource {
     /// Working tree (incl. index + untracked) vs HEAD — local uncommitted work.
     WorkingTree,
