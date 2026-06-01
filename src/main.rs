@@ -316,8 +316,20 @@ struct App {
     /// survives repaints; applied to the egui context each frame.
     ui_scale: f32,
     /// Set when a key-nav action wants the content scroll area moved to a
-    /// specific vertical offset on the next frame.
+    /// specific vertical offset on the next frame. Used ONLY by PageUp/PageDown,
+    /// which page relative to the live (actual) scroll offset — never derived
+    /// from `row * row_h`, so it's immune to the variable-row-height drift.
     pending_scroll: Option<f32>,
+    /// "Bring this cache row into view" request — the ONE source of truth for
+    /// every jump-to-row (n/p, Ctrl+F match, j/k first hunk, F12/go-to-def).
+    /// Resolved by calling `Response::scroll_to_me(align)` on the row whose
+    /// index equals the target as it's laid out in the content scroll area
+    /// (both the unified path and `split_panes`). Because that uses the row's
+    /// ACTUAL rect, variable row heights (tall HunkHeader strips) are handled by
+    /// egui with zero pixel math — no drift. The `usize` is the cache-row index;
+    /// the `Align` is where to land it (Center for matches/hunks, Min for the
+    /// file-switch "first hunk to the top"). Consumed (taken) once applied.
+    scroll_to_row: Option<(usize, egui::Align)>,
     /// Set by j/k when switching to a different changed file: scroll so that
     /// file's FIRST hunk header is at the top. Resolved AFTER `ensure_cache`
     /// rebuilds `hunk_rows` for the new file (the header row isn't known at
@@ -366,6 +378,14 @@ struct App {
     /// height, captured each frame so PageUp/PageDown can move by a page.
     content_scroll: f32,
     content_viewport_h: f32,
+    /// The cache-row range egui ACTUALLY painted in the content area last frame
+    /// (from `show_rows`' `range`), as an inclusive `[first, last]`. This is the
+    /// real visible window — it accounts for variable row heights, unlike the
+    /// old `content_scroll / row_h .. + viewport / row_h` estimate, which
+    /// drifted past any tall HunkHeader rows above the viewport. n/p reads this
+    /// to decide whether the target hunk is already on screen. `None` until the
+    /// first content frame paints.
+    visible_rows: Option<(usize, usize)>,
 }
 
 impl App {
@@ -414,6 +434,7 @@ impl App {
             lineno_width: 1,
             ui_scale: 1.0,
             pending_scroll: None,
+            scroll_to_row: None,
             scroll_to_first_hunk: false,
             editing: None,
             diff_rx: None,
@@ -430,6 +451,7 @@ impl App {
             last_open_path: None,
             content_scroll: 0.0,
             content_viewport_h: 0.0,
+            visible_rows: None,
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -1475,19 +1497,18 @@ impl App {
         }
 
         // n/p: move to the next/prev hunk RELATIVE TO THE CURRENT SCROLL
-        // POSITION (not just focus_hunk ± 1) and scroll it into view. Anchoring
-        // on the viewport top row means n/p always target the hunk just below /
-        // above what's on screen, even when no hunk header is currently visible
-        // (the bug: stepping focus_hunk alone could jump to a hunk above the
-        // viewport, feeling like a page move).
+        // POSITION (not just focus_hunk ± 1) and scroll it into view. The
+        // visible window comes from the rows egui ACTUALLY painted last frame
+        // (`self.visible_rows`), NOT from `content_scroll / row_h`: with tall
+        // HunkHeader strips above the viewport the latter over-counts rows and
+        // reports the wrong [top,bottom], which inverted the "is it visible?"
+        // test (scrolling when the target was already on screen, and not
+        // scrolling when it was off-screen — the reported bug). The painted
+        // range is exact for any mix of row heights.
         if (n || p) && !self.hunk_rows.is_empty() {
-            let row_h = ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0;
-            let top_row = (self.content_scroll / row_h).floor().max(0.0) as usize;
-            // The last fully/partly visible cache row. viewport_h may be 0 on
-            // the very first frame; fall back to top_row so focus is treated as
-            // "visible" only when it's exactly at the top.
-            let visible_rows = (self.content_viewport_h / row_h).floor().max(0.0) as usize;
-            let bottom_row = top_row + visible_rows;
+            // Before the first content frame paints, treat row 0 as the lone
+            // visible row so a target only counts as "visible" at the very top.
+            let (top_row, bottom_row) = self.visible_rows.unwrap_or((0, 0));
             match nav_hunk_from_scroll(&self.hunk_rows, top_row, bottom_row, self.focus_hunk, n) {
                 Some(target) => self.focus_hunk = target,
                 // No hunk in that direction — clamp to the edge in this
@@ -1496,12 +1517,14 @@ impl App {
                     self.focus_hunk = if n { self.hunk_rows.len() - 1 } else { 0 };
                 }
             }
-            // Only scroll when the target hunk is OUTSIDE the current viewport.
-            // If it's already on screen, just move focus and leave the user's
-            // scroll position untouched (don't yank them around).
+            // Only scroll when the target hunk is OUTSIDE the current (real)
+            // viewport. If it's already on screen, just move focus and leave the
+            // user's scroll position untouched (don't yank them around). When it
+            // is off-screen, request a scroll-to-row centered via scroll_to_me —
+            // egui uses the row's actual rect, so no `row * row_h` drift.
             let row = self.hunk_rows.get(self.focus_hunk).copied().unwrap_or(0);
             if !row_in_viewport(row, top_row, bottom_row) {
-                self.pending_scroll = Some(row as f32 * row_h);
+                self.scroll_to_row = Some((row, egui::Align::Center));
             }
         }
 
@@ -1636,10 +1659,12 @@ impl App {
         search.just_opened = just_opened;
 
         if let Some(row) = scroll_to {
-            let row_h = ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0;
-            // A few rows of headroom so the match isn't jammed at the very top.
-            let target = row.saturating_sub(3);
-            self.pending_scroll = Some(target as f32 * row_h);
+            // Center the matched row via scroll_to_me on its actual rect — no
+            // `row * row_h` math, so a tall HunkHeader above the match can't push
+            // the landing spot "slightly below the page" (the reported bug). The
+            // unused `ctx` borrow is dropped; the request is consumed in `ui`.
+            let _ = ctx;
+            self.scroll_to_row = Some((row, egui::Align::Center));
         }
     }
 
@@ -2040,20 +2065,28 @@ impl App {
 
             let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
             let total = self.cache.len();
-            // Resolve any pending vertical scroll (n/p hunk jump, or go-to-def
-            // line jump) into an absolute offset to apply this frame.
-            let mut pending_v: Option<f32> = self.pending_scroll.take();
+            // PageUp/PageDown's relative pager offset (the only remaining pixel
+            // scroll — it's relative to the live offset, not `row * row_h`).
+            let pending_v: Option<f32> = self.pending_scroll.take();
+            // go-to-def line jump: in Plain (full-file) view cache row == file
+            // line - 1, so route it through the same accurate scroll-to-row
+            // mechanism (centered) instead of `line * row_h`, which drifted.
             if let Some(line) = self.pending_line.take() {
-                let target = line.saturating_sub(1).saturating_sub(8); // a little headroom
-                pending_v = Some(target as f32 * row_h);
+                let target = line.saturating_sub(1).min(total.saturating_sub(1));
+                self.scroll_to_row = Some((target, egui::Align::Center));
             }
             // j/k file switch: now that ensure_cache has rebuilt hunk_rows for
-            // the newly selected file, scroll its first hunk header to the top.
+            // the newly selected file, scroll its first hunk header to the TOP
+            // (Align::Min) via scroll_to_me — accurate for variable row heights.
             if self.scroll_to_first_hunk {
                 self.scroll_to_first_hunk = false;
                 let first = self.hunk_rows.first().copied().unwrap_or(0);
-                pending_v = Some(first as f32 * row_h);
+                self.scroll_to_row = Some((first, egui::Align::Min));
             }
+            // The accurate scroll-to-row request (n/p, search, j/k, F12). Read
+            // (not yet taken) here so both the unified path and split_panes can
+            // act on it; cleared after the content area paints.
+            let scroll_to_row = self.scroll_to_row;
 
             // Split layout draws two side-by-side panes that scroll
             // HORIZONTALLY on their own (a long line on the left never shifts
@@ -2062,11 +2095,12 @@ impl App {
             // unified scroll area.
             if self.layout == Layout::Split && matches!(self.selected, Some(Selection::Changed(_)))
             {
-                let (off, vp) = self.split_panes(
+                let (off, vp, painted) = self.split_panes(
                     ui,
                     row_h,
                     total,
                     pending_v,
+                    scroll_to_row,
                     sel_sym.as_deref(),
                     &mut clicked_symbol,
                     active_file,
@@ -2077,19 +2111,34 @@ impl App {
                 );
                 content_scroll = off;
                 content_viewport_h = vp;
+                if let Some(pr) = painted {
+                    self.visible_rows = Some(pr);
+                }
+                // Consume the scroll request (the split path handled it).
+                self.scroll_to_row = None;
                 return;
             }
 
             let mut area = egui::ScrollArea::both().auto_shrink([false, false]);
             if let Some(off) = pending_v {
                 area = area.vertical_scroll_offset(off);
+            } else if let Some((target, _)) = scroll_to_row {
+                // Coarse pre-position so the target row is inside the painted
+                // band this frame (show_rows only lays out the visible window).
+                // `target * row_h` need only get us WITHIN a viewport of the
+                // row; the exact landing is then done by scroll_to_rect on the
+                // row's real rect below — so the approximation's drift doesn't
+                // matter (it's corrected the same frame against actual geometry).
+                area = area.vertical_scroll_offset((target as f32 * row_h).max(0.0));
             }
+            let mut painted: Option<(usize, usize)> = None;
             let out = area.show_rows(
                 ui,
                 row_h,
                 total,
                 |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    painted = Some((range.start, range.end.saturating_sub(1)));
                     let focus_row = self.hunk_rows.get(self.focus_hunk).copied();
                     for i in range {
                         // Ctrl+F highlight: tint matched rows; the current match
@@ -2204,26 +2253,41 @@ impl App {
                                 });
                             }
                         }
+                        // The row's ACTUAL on-screen rect (variable height).
+                        let y_after = ui.cursor().min.y;
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(ui.max_rect().min.x, y_before),
+                            egui::vec2(ui.max_rect().width(), (y_after - y_before).max(row_h)),
+                        );
                         // Overlay the search tint across the row just drawn.
                         if let Some(tint) = search_tint {
-                            let y_after = ui.cursor().min.y;
-                            let h = (y_after - y_before).max(row_h);
-                            let rect = egui::Rect::from_min_size(
-                                egui::pos2(ui.max_rect().min.x, y_before),
-                                egui::vec2(ui.max_rect().width(), h),
-                            );
-                            ui.painter().rect_filled(rect, 0.0, tint);
+                            ui.painter().rect_filled(row_rect, 0.0, tint);
+                        }
+                        // Accurate scroll-to-row: when THIS row is the target,
+                        // ask the scroll area to bring its real rect into view
+                        // at the requested alignment. Variable row heights are
+                        // handled by egui — no `row * row_h` drift.
+                        if let Some((target, align)) = scroll_to_row {
+                            if i == target {
+                                ui.scroll_to_rect(row_rect, Some(align));
+                            }
                         }
                     }
                 },
             );
             content_scroll = out.state.offset.y;
             content_viewport_h = out.inner_rect.height();
+            if let Some(pr) = painted {
+                self.visible_rows = Some(pr);
+            }
         });
 
         // Record the content-pane scroll geometry for next frame's PageUp/Down.
         self.content_scroll = content_scroll;
         self.content_viewport_h = content_viewport_h;
+        // Consume the unified path's scroll-to-row request (the split path
+        // clears its own before returning). One request, one applied jump.
+        self.scroll_to_row = None;
 
         // Apply review-status changes collected during render, then persist
         // the review state for the MCP server.
@@ -2279,8 +2343,13 @@ impl App {
     /// HunkHeader rows are control strips that span the whole width; they're
     /// drawn in the LEFT pane and mirrored as an equal-height blank in the
     /// right pane so both panes advance by the same number of rows.
-    /// Returns the panes' shared (vertical_offset, viewport_height) so the
-    /// caller can record them for PageUp/PageDown.
+    /// Returns the panes' shared (vertical_offset, viewport_height, painted_row
+    /// range) so the caller can record them for PageUp/PageDown and the n/p
+    /// visibility test. `scroll_to_row` is the accurate "bring this cache row
+    /// into view" request (see the `App::scroll_to_row` field): the left pane
+    /// calls `scroll_to_rect` on the target row's REAL rect, and the resulting
+    /// offset is captured into the shared offset so the jump sticks and both
+    /// panes stay aligned — no `row * row_h` drift in either direction.
     #[allow(clippy::too_many_arguments)]
     fn split_panes(
         &self,
@@ -2288,6 +2357,7 @@ impl App {
         row_h: f32,
         total: usize,
         pending_v: Option<f32>,
+        scroll_to_row: Option<(usize, egui::Align)>,
         sel: Option<&str>,
         clicked_symbol: &mut Option<String>,
         active_file: Option<usize>,
@@ -2295,7 +2365,7 @@ impl App {
         replies: &Replies,
         pending: &mut Vec<(usize, ReviewStatus)>,
         open_comment: &mut Option<usize>,
-    ) -> (f32, f32) {
+    ) -> (f32, f32, Option<(usize, usize)>) {
         // Cache row of the focused hunk's header, so the strip can draw its
         // focus marker (matches the unified path's `focus_row`).
         let focus_row = self.hunk_rows.get(self.focus_hunk).copied();
@@ -2309,9 +2379,17 @@ impl App {
             .ctx()
             .memory(|m| m.data.get_temp(scroll_id))
             .unwrap_or(0.0);
-        let v_off = pending_v.unwrap_or(carried);
+        // A scroll-to-row request coarse-positions the offset so the target row
+        // is inside the painted band this frame; scroll_to_rect (below) then
+        // lands it exactly off the row's real rect. Otherwise carry the offset.
+        let v_off = match (pending_v, scroll_to_row) {
+            (Some(off), _) => off,
+            (None, Some((target, _))) => (target as f32 * row_h).max(0.0),
+            (None, None) => carried,
+        };
         let mut new_off = v_off;
         let mut viewport_h = 0.0_f32;
+        let mut painted: Option<(usize, usize)> = None;
         let lineno_w = self.lineno_width;
 
         ui.horizontal_top(|ui| {
@@ -2329,7 +2407,9 @@ impl App {
                     // stacking (the Full+Split "all on one line" regression).
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
+                        painted = Some((range.start, range.end.saturating_sub(1)));
                         for i in range {
+                            let y_before = ui.cursor().min.y;
                             match &self.cache[i] {
                                 RenderRow::SplitLine { left, .. } => {
                                     let kind = left.as_ref().map(|(k, _, _)| *k);
@@ -2364,10 +2444,30 @@ impl App {
                                     ui.label(" ");
                                 }
                             }
+                            // Accurate scroll-to-row off the left pane's real
+                            // row rect (variable heights → no drift). The
+                            // resulting offset is captured into the shared
+                            // offset below so the right pane follows in lockstep.
+                            if let Some((target, align)) = scroll_to_row {
+                                if i == target {
+                                    let y_after = ui.cursor().min.y;
+                                    let rect = egui::Rect::from_min_size(
+                                        egui::pos2(ui.max_rect().min.x, y_before),
+                                        egui::vec2(
+                                            ui.max_rect().width(),
+                                            (y_after - y_before).max(row_h),
+                                        ),
+                                    );
+                                    ui.scroll_to_rect(rect, Some(align));
+                                }
+                            }
                         }
                     });
                 });
-            // The user's vertical drag on the left pane wins this frame.
+            // The user's vertical drag on the left pane wins this frame; a
+            // scroll_to_rect jump also shows up here as a changed offset. Either
+            // way, adopt the left pane's resulting offset so it sticks across
+            // frames and the right pane follows it.
             if (left.state.offset.y - v_off).abs() > 0.5 {
                 new_off = left.state.offset.y;
             }
@@ -2421,7 +2521,7 @@ impl App {
         // Persist the synced vertical offset for the next frame.
         ui.ctx()
             .memory_mut(|m| m.data.insert_temp(scroll_id, new_off));
-        (new_off, viewport_h)
+        (new_off, viewport_h, painted)
     }
 
     /// Render the per-hunk control strip: focus marker, status glyph (✓/✗/○),
@@ -2645,9 +2745,12 @@ fn keybindings() -> &'static [(&'static str, &'static str)] {
 /// Returns the index INTO `hunk_rows`, or `None` if there is no hunk in that
 /// direction (caller keeps / clamps the focus).
 /// Whether cache `row` falls within the inclusive `[top_row, bottom_row]`
-/// viewport span (the rows currently on screen). Used by n/p to decide whether
-/// the target hunk needs scrolling into view: if it's already visible, focus
-/// moves but the scroll position is left alone.
+/// viewport span (the rows currently on screen). `[top_row, bottom_row]` is the
+/// range egui ACTUALLY painted last frame (`App::visible_rows`), so this is
+/// exact for any mix of row heights — unlike a `content_scroll / row_h` estimate
+/// that drifts past tall HunkHeader strips. Used by n/p to decide whether the
+/// target hunk needs scrolling into view: if it's already visible, focus moves
+/// but the scroll position is left alone.
 fn row_in_viewport(row: usize, top_row: usize, bottom_row: usize) -> bool {
     row >= top_row && row <= bottom_row
 }
@@ -2712,6 +2815,50 @@ fn find_matches(rows: &[RenderRow], query: &str) -> Vec<usize> {
         .filter(|(_, r)| row_search_text(r).to_lowercase().contains(&q))
         .map(|(i, _)| i)
         .collect()
+}
+
+/// The inclusive `[first, last]` cache-row range visible in a viewport of
+/// height `viewport_h` scrolled to `offset`, given each row's ACTUAL height in
+/// `heights`. This is the accurate, variable-height answer the live path gets
+/// from egui's painted `range`; kept as a pure function so the root-cause math
+/// (rows are NOT uniform — a tall HunkHeader shifts every later row's y) can be
+/// unit-tested directly. A row counts as visible if any part of it intersects
+/// `[offset, offset + viewport_h)`. Empty `heights` → `None`.
+///
+/// Contrast with the OLD, buggy approach `offset / row_h .. (offset+vp) / row_h`
+/// which assumes a single uniform `row_h` and therefore drifts by the
+/// accumulated extra height of any tall rows above the viewport.
+///
+/// The LIVE code doesn't call this: egui's `show_rows` hands us the actually-
+/// painted `range` directly (an even more authoritative source of truth), which
+/// we store in `App::visible_rows`. This function exists to lock the underlying
+/// variable-height math in a test so the root-cause assumption can't silently
+/// regress to `index * row_h`.
+#[cfg(test)]
+fn visible_range_from_heights(heights: &[f32], offset: f32, viewport_h: f32) -> Option<(usize, usize)> {
+    if heights.is_empty() {
+        return None;
+    }
+    let top = offset.max(0.0);
+    let bottom = top + viewport_h.max(0.0);
+    let mut y = 0.0_f32;
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    for (i, &h) in heights.iter().enumerate() {
+        let row_top = y;
+        let row_bottom = y + h;
+        // Visible if the row's span intersects the viewport span. The bottom
+        // edge is inclusive so a viewport sitting exactly on a boundary still
+        // shows the row beginning there.
+        if row_bottom > top && row_top <= bottom {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = i;
+        }
+        y = row_bottom;
+    }
+    first.map(|f| (f, last))
 }
 
 /// New vertical scroll offset after a Page Up/Down. `down` scrolls toward the
@@ -4071,6 +4218,198 @@ mod ui_tests {
         // that exact row is "visible".
         assert!(row_in_viewport(5, 5, 5));
         assert!(!row_in_viewport(6, 5, 5));
+    }
+
+    // ===================================================================
+    // ROOT CAUSE: variable row heights. The old code computed "which rows are
+    // visible" and "where is row N" as `index * row_h` with a single fixed
+    // row_h. HunkHeader control strips are TALLER than diff lines, so that math
+    // drifts by the accumulated extra height of any tall row above the target —
+    // the source of the n/p "scrolls when already visible / doesn't when off-
+    // screen" and the Ctrl+F "lands below the page" bugs. These lock the
+    // accurate, height-aware computation that replaces it.
+    // ===================================================================
+
+    /// `visible_range_from_heights` with a NON-UNIFORM row mix (tall headers +
+    /// short diff lines) returns the rows that actually intersect the viewport —
+    /// and that answer DIFFERS from the old `offset / row_h` assumption, which is
+    /// exactly the drift bug. This would FAIL if visibility were still computed
+    /// off a single uniform row_h.
+    #[test]
+    fn visible_range_handles_variable_row_heights() {
+        // Layout: a tall 40px HunkHeader at row 0, then nine 18px diff lines.
+        // y-tops: r0=0, r1=40, r2=58, r3=76, r4=94, r5=112, r6=130, r7=148,
+        //         r8=166, r9=184; total = 202.
+        let mut heights = vec![40.0_f32];
+        heights.extend(std::iter::repeat(18.0).take(9));
+
+        // Viewport [80, 170): a 90px window scrolled 80px down. It intersects
+        // rows whose [top,bottom) overlaps [80,170): r2(58..76)? 76>80? no.
+        // r3(76..94) yes … r8(166..184) yes. So first=3, last=8.
+        let got = visible_range_from_heights(&heights, 80.0, 90.0).unwrap();
+        assert_eq!(got, (3, 8), "height-aware visible range");
+
+        // The OLD uniform-row_h estimate (using the SHORT row_h=18) would say
+        // top = floor(80/18) = 4, bottom = floor((80+90)/18) = 9 → (4, 9).
+        // It's WRONG on BOTH ends precisely because the 40px header above shifts
+        // every later row down. Assert the accurate answer is NOT that estimate.
+        let naive_row_h = 18.0_f32;
+        let naive_top = (80.0_f32 / naive_row_h).floor() as usize;
+        let naive_bottom = ((80.0_f32 + 90.0) / naive_row_h).floor() as usize;
+        assert_ne!(
+            got,
+            (naive_top, naive_bottom),
+            "the uniform-row_h estimate ({naive_top},{naive_bottom}) drifts from the \
+             height-aware truth (3,8) — this is the root-cause bug"
+        );
+
+        // From the very top, the tall header (row 0) is visible.
+        assert_eq!(visible_range_from_heights(&heights, 0.0, 50.0), Some((0, 1)));
+        // Empty → None.
+        assert_eq!(visible_range_from_heights(&[], 0.0, 100.0), None);
+    }
+
+    /// END-TO-END (kittest): n/p with the REAL variable-height layout. Targeting
+    /// an OFF-SCREEN hunk must move the view (the target becomes the centered
+    /// scroll request and the offset changes); pressing toward a hunk that is
+    /// ALREADY visible must NOT change the scroll offset. This exercises the
+    /// painted-range visibility test + scroll_to_rect jump through `app.ui`,
+    /// over a file whose Full-extent view interleaves tall HunkHeader strips
+    /// among short diff lines — the exact mix the old `index * row_h` math got
+    /// wrong.
+    #[test]
+    fn np_scrolls_to_offscreen_hunk_and_not_when_visible() {
+        let repo = multi_hunk_repo(); // 30-line file, 2 well-separated hunks
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full; // whole file + per-hunk strips → scrollable
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        assert!(app.files[0].hunks.len() >= 2, "need ≥2 hunks");
+
+        // A deliberately SHORT window so the 30-line file overflows it and the
+        // second hunk (near line 27) is genuinely off-screen from the top —
+        // otherwise the whole file fits and n correctly wouldn't need to scroll.
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 220.0))
+            .build_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        harness.run(); // let the painted range settle
+
+        // The second hunk is far down the 30-line file → off-screen at the top.
+        let before = harness.state().content_scroll;
+        harness.press_key(egui::Key::N); // jump to the next hunk (off-screen)
+        harness.run();
+        harness.run(); // apply the scroll_to_rect + recapture offset
+        let after_jump = harness.state().content_scroll;
+        assert!(
+            after_jump > before,
+            "n to an off-screen hunk must scroll the view down (before {before}, after {after_jump})"
+        );
+        // The focused hunk's header row is now within the painted (real) range.
+        let st = harness.state();
+        let focus_row = st.hunk_rows[st.focus_hunk];
+        let (top, bot) = st.visible_rows.expect("a frame painted");
+        assert!(
+            row_in_viewport(focus_row, top, bot),
+            "after the jump the target hunk header (row {focus_row}) is in the painted \
+             viewport [{top},{bot}]"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The flip side of the n/p behavior: when the target hunk is ALREADY on
+    /// screen, n/p moves focus but must NOT move the scroll offset (don't yank
+    /// the user around). A TALL window shows the whole small file, so both hunks
+    /// are visible from the top; pressing n (to hunk 1, visible) leaves the
+    /// scroll offset put. This would regress if visibility were mis-computed by
+    /// `index * row_h` and reported the on-screen hunk as off-screen.
+    #[test]
+    fn np_does_not_scroll_when_target_hunk_already_visible() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Summary; // just the hunks → compact, both fit
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        assert!(app.files[0].hunks.len() >= 2, "need ≥2 hunks");
+
+        // A tall window so the whole (compact, Summary) diff fits → both hunk
+        // headers are visible without any scrolling.
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 900.0))
+            .build_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        harness.run();
+
+        // Confirm both hunk headers are within the painted viewport from the top.
+        let st = harness.state();
+        let (top, bot) = st.visible_rows.expect("painted");
+        assert!(
+            st.hunk_rows.iter().all(|&r| row_in_viewport(r, top, bot)),
+            "the tall window should show every hunk header (rows {:?} in [{top},{bot}])",
+            st.hunk_rows
+        );
+        let before = st.content_scroll;
+        assert_eq!(before, 0.0, "starts at the top with everything visible");
+
+        // n moves focus to hunk 1 (already visible) — the offset must not move.
+        harness.press_key(egui::Key::N);
+        harness.run();
+        harness.run();
+        let st = harness.state();
+        assert_eq!(st.focus_hunk, 1, "n advances focus to the next hunk");
+        assert!(
+            (st.content_scroll - before).abs() < 1.0,
+            "n to an already-visible hunk must NOT scroll (offset {} vs {before})",
+            st.content_scroll
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// END-TO-END (kittest): Ctrl+F jump centers the matched row in the viewport.
+    /// With tall HunkHeader strips above, the old `row * row_h` scroll landed the
+    /// match "below the page"; the scroll_to_rect-on-actual-rect jump must put
+    /// the matched cache row inside the painted viewport.
+    #[test]
+    fn search_jump_lands_match_in_viewport() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full; // whole file → a match can be far down
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+
+        // Short window so the match near line 27 starts off-screen and a jump is
+        // actually required (otherwise the whole 30-line file fits).
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 220.0))
+            .build_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+
+        // Open search and target a string that occurs near the BOTTOM of the
+        // file (line 27 was edited to "LINE 27 EDIT"), so the match is off-screen
+        // from the top and a jump is required.
+        harness.state_mut().search = Some(Search {
+            query: "27".to_string(),
+            matches: Vec::new(),
+            current: 0,
+            just_opened: false,
+            computed_for: None,
+            last_scrolled: None,
+        });
+        harness.run(); // search_bar computes matches + requests the scroll
+        harness.run(); // scroll_to_rect applies + painted range recaptured
+
+        let st = harness.state();
+        let s = st.search.as_ref().expect("search open");
+        assert!(!s.matches.is_empty(), "‘27’ should match at least one row");
+        let cur_row = s.matches[s.current];
+        let (top, bot) = st.visible_rows.expect("a frame painted");
+        assert!(
+            row_in_viewport(cur_row, top, bot),
+            "the matched row {cur_row} must be within the painted viewport [{top},{bot}] \
+             after the search jump (not drifted below the page)"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     // ===================================================================
