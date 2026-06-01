@@ -118,16 +118,23 @@ enum RenderRow {
         text: String,
         whole_file: bool,
     },
-    /// A diff content line (add/del/ctx), raw text.
-    DiffLine { kind: LineKind, text: String },
-    /// A full-file content line, raw text.
-    Plain { text: String },
+    /// A diff content line (add/del/ctx), raw text. Carries its source line
+    /// numbers (old/new side) for the gutter.
+    DiffLine {
+        kind: LineKind,
+        text: String,
+        old_lineno: Option<u32>,
+        new_lineno: Option<u32>,
+    },
+    /// A full-file content line, raw text. `lineno` is its 1-based file line.
+    Plain { text: String, lineno: u32 },
     /// A side-by-side row: a cell on each side, either of which may be empty
     /// (a deletion has no right cell; an addition has no left cell; context
-    /// shows on both). Highlighted lazily via `split_spans`.
+    /// shows on both). Highlighted lazily via `split_spans`. Each cell carries
+    /// its own source line number (old on the left, new on the right).
     SplitLine {
-        left: Option<(LineKind, String)>,
-        right: Option<(LineKind, String)>,
+        left: Option<(LineKind, String, Option<u32>)>,
+        right: Option<(LineKind, String, Option<u32>)>,
     },
 }
 
@@ -184,6 +191,12 @@ struct App {
     focus_hunk: usize,
     /// Cache-row index of each hunk's header row, so n/p can scroll to it.
     hunk_rows: Vec<usize>,
+    /// Digit-width of the largest line number in the current cache, so the
+    /// gutter number columns are right-aligned to a stable width.
+    lineno_width: usize,
+    /// User-chosen UI scale (Ctrl +/-/0). Persisted in App state so it
+    /// survives repaints; applied to the egui context each frame.
+    ui_scale: f32,
     /// Set when a key-nav action wants the content scroll area moved to a
     /// specific vertical offset on the next frame.
     pending_scroll: Option<f32>,
@@ -243,6 +256,8 @@ impl App {
             split_cache: std::cell::RefCell::new(Vec::new()),
             focus_hunk: 0,
             hunk_rows: Vec::new(),
+            lineno_width: 1,
+            ui_scale: 1.0,
             pending_scroll: None,
             editing: None,
             diff_rx: None,
@@ -579,6 +594,8 @@ impl App {
                                 out.push(RenderRow::DiffLine {
                                     kind: r.kind,
                                     text: r.text.clone(),
+                                    old_lineno: r.old_lineno,
+                                    new_lineno: r.new_lineno,
                                 });
                             }
                         }
@@ -592,18 +609,40 @@ impl App {
                 plain = true;
                 match self.read_full_file(&path) {
                     Ok(content) => {
-                        for line in content.lines() {
-                            out.push(RenderRow::Plain { text: line.to_string() });
+                        for (i, line) in content.lines().enumerate() {
+                            out.push(RenderRow::Plain {
+                                text: line.to_string(),
+                                lineno: i as u32 + 1,
+                            });
                         }
                     }
                     Err(e) => out.push(RenderRow::Plain {
                         text: format!("cannot read file: {e}"),
+                        lineno: 1,
                     }),
                 }
             }
         }
 
         let n = out.len();
+        // Widest line number across all rows → fixed gutter column width.
+        let max_lineno = out
+            .iter()
+            .map(|r| match r {
+                RenderRow::DiffLine { old_lineno, new_lineno, .. } => {
+                    old_lineno.unwrap_or(0).max(new_lineno.unwrap_or(0))
+                }
+                RenderRow::Plain { lineno, .. } => *lineno,
+                RenderRow::SplitLine { left, right } => {
+                    let l = left.as_ref().and_then(|(_, _, n)| *n).unwrap_or(0);
+                    let r = right.as_ref().and_then(|(_, _, n)| *n).unwrap_or(0);
+                    l.max(r)
+                }
+                RenderRow::HunkHeader { .. } => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        self.lineno_width = max_lineno.max(1).to_string().len();
         // Record each hunk header's row index (for n/p scroll-to nav).
         self.hunk_rows = out
             .iter()
@@ -658,11 +697,11 @@ impl App {
             RenderRow::SplitLine { left, right } => {
                 let l = left
                     .as_ref()
-                    .map(|(_, t)| self.hl.highlight_line(&self.cache_path, t))
+                    .map(|(_, t, _)| self.hl.highlight_line(&self.cache_path, t))
                     .unwrap_or_default();
                 let r = right
                     .as_ref()
-                    .map(|(_, t)| self.hl.highlight_line(&self.cache_path, t))
+                    .map(|(_, t, _)| self.hl.highlight_line(&self.cache_path, t))
                     .unwrap_or_default();
                 (l, r)
             }
@@ -681,7 +720,7 @@ impl App {
         while st.next <= i {
             let n = st.next;
             let text = match &self.cache[n] {
-                RenderRow::Plain { text } => text.as_str(),
+                RenderRow::Plain { text, .. } => text.as_str(),
                 _ => "",
             };
             let spans = self.hl.highlight_incremental(st, text);
@@ -1052,6 +1091,29 @@ impl App {
         if self.loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+
+        // Ctrl +/- text zoom, Ctrl+0 reset. We drive egui's UI scaling and keep
+        // the chosen factor in `ui_scale` so it persists across repaints. Only
+        // fires with Ctrl/Cmd held, so it never collides with the bare-letter
+        // nav keys (j/k/n/p/a/r/c/g/F12). Ctrl+= is handled too: most keyboards
+        // send "=" for the unshifted "+" key.
+        let (zoom_in, zoom_out, zoom_reset) = ctx.input(|i| {
+            let m = i.modifiers.ctrl || i.modifiers.command;
+            (
+                m && (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)),
+                m && i.key_pressed(egui::Key::Minus),
+                m && i.key_pressed(egui::Key::Num0),
+            )
+        });
+        if zoom_reset {
+            self.ui_scale = 1.0;
+        } else if zoom_in {
+            self.ui_scale = (self.ui_scale + 0.1).min(3.0);
+        } else if zoom_out {
+            self.ui_scale = (self.ui_scale - 0.1).max(0.6);
+        }
+        // Apply every frame so the scale survives repaints/reloads.
+        ctx.set_pixels_per_point(self.ui_scale);
 
         // Ctrl+P opens the fuzzy file finder. (Cmd+P on mac.)
         let toggle_qo = ctx.input(|i| {
@@ -1440,31 +1502,35 @@ impl App {
                                         });
                                     });
                             }
-                            RenderRow::DiffLine { kind, .. } => {
-                                let (bg, gutter) = match kind {
-                                    LineKind::Add => {
-                                        (Some(Color32::from_rgb(22, 50, 22)), "+ ")
-                                    }
-                                    LineKind::Del => {
-                                        (Some(Color32::from_rgb(55, 22, 22)), "- ")
-                                    }
-                                    _ => (None, "  "),
+                            RenderRow::DiffLine { kind, old_lineno, new_lineno, .. } => {
+                                let (bg, marker) = match kind {
+                                    LineKind::Add => (Some(Color32::from_rgb(22, 50, 22)), '+'),
+                                    LineKind::Del => (Some(Color32::from_rgb(55, 22, 22)), '-'),
+                                    _ => (None, ' '),
                                 };
+                                // Gutter: right-aligned old# new# then the marker.
+                                let w = self.lineno_width;
+                                let gutter = format!(
+                                    "{} {} {} ",
+                                    fmt_lineno(*old_lineno, w),
+                                    fmt_lineno(*new_lineno, w),
+                                    marker,
+                                );
                                 let spans = self.row_spans(i); // lazy, memoized
                                 let sel = sel_sym.as_deref();
                                 let clk = if let Some(bg) = bg {
                                     egui::Frame::none()
                                         .fill(bg)
-                                        .show(ui, |ui| line_row(ui, gutter, &spans, sel, true))
+                                        .show(ui, |ui| line_row(ui, &gutter, &spans, sel, true))
                                         .inner
                                 } else {
-                                    line_row(ui, gutter, &spans, sel, true)
+                                    line_row(ui, &gutter, &spans, sel, true)
                                 };
                                 if clk.is_some() {
                                     clicked_symbol = clk;
                                 }
                             }
-                            RenderRow::Plain { text } => {
+                            RenderRow::Plain { text, lineno } => {
                                 if edit_row == Some(i) {
                                     // This line is being edited: inline TextEdit.
                                     let te = ui.add(
@@ -1483,10 +1549,12 @@ impl App {
                                     }
                                 } else {
                                     let spans = self.row_spans(i); // lazy, memoized
+                                    let gutter =
+                                        format!("{} ", fmt_lineno(Some(*lineno), self.lineno_width));
                                     // Not clickable-for-symbols in file view; the
                                     // row-level response catches double-click to edit.
                                     let resp = ui
-                                        .scope(|ui| line_row(ui, "", &spans, None, false))
+                                        .scope(|ui| line_row(ui, &gutter, &spans, None, false))
                                         .response
                                         .interact(egui::Sense::click());
                                     if can_edit && resp.double_clicked() {
@@ -1495,15 +1563,22 @@ impl App {
                                 }
                             }
                             RenderRow::SplitLine { left, right } => {
-                                let lkind = left.as_ref().map(|(k, _)| *k);
-                                let rkind = right.as_ref().map(|(k, _)| *k);
+                                let lkind = left.as_ref().map(|(k, _, _)| *k);
+                                let rkind = right.as_ref().map(|(k, _, _)| *k);
+                                let lno = left.as_ref().and_then(|(_, _, n)| *n);
+                                let rno = right.as_ref().and_then(|(_, _, n)| *n);
                                 let (lspans, rspans) = self.split_spans(i);
                                 let sel = sel_sym.as_deref();
+                                let w = self.lineno_width;
                                 ui.columns(2, |cols| {
-                                    if let Some(s) = split_cell(&mut cols[0], lkind, &lspans, sel) {
+                                    if let Some(s) =
+                                        split_cell(&mut cols[0], lkind, lno, w, &lspans, sel)
+                                    {
                                         clicked_symbol = Some(s);
                                     }
-                                    if let Some(s) = split_cell(&mut cols[1], rkind, &rspans, sel) {
+                                    if let Some(s) =
+                                        split_cell(&mut cols[1], rkind, rno, w, &rspans, sel)
+                                    {
                                         clicked_symbol = Some(s);
                                     }
                                 });
@@ -1561,15 +1636,19 @@ impl App {
 /// only). This is the standard split-diff pairing.
 fn split_align(rows: &[diff::DiffLineRow]) -> Vec<RenderRow> {
     let mut out: Vec<RenderRow> = Vec::new();
-    let mut dels: Vec<String> = Vec::new();
-    let mut adds: Vec<String> = Vec::new();
+    // Buffered (text, lineno): deletions carry their old number, additions
+    // their new number.
+    let mut dels: Vec<(String, Option<u32>)> = Vec::new();
+    let mut adds: Vec<(String, Option<u32>)> = Vec::new();
 
     // Flush buffered deletions/additions as paired/one-sided split rows.
-    let flush = |out: &mut Vec<RenderRow>, dels: &mut Vec<String>, adds: &mut Vec<String>| {
+    let flush = |out: &mut Vec<RenderRow>,
+                 dels: &mut Vec<(String, Option<u32>)>,
+                 adds: &mut Vec<(String, Option<u32>)>| {
         let pairs = dels.len().max(adds.len());
         for i in 0..pairs {
-            let left = dels.get(i).map(|t| (LineKind::Del, t.clone()));
-            let right = adds.get(i).map(|t| (LineKind::Add, t.clone()));
+            let left = dels.get(i).map(|(t, n)| (LineKind::Del, t.clone(), *n));
+            let right = adds.get(i).map(|(t, n)| (LineKind::Add, t.clone(), *n));
             out.push(RenderRow::SplitLine { left, right });
         }
         dels.clear();
@@ -1578,13 +1657,13 @@ fn split_align(rows: &[diff::DiffLineRow]) -> Vec<RenderRow> {
 
     for r in rows {
         match r.kind {
-            LineKind::Del => dels.push(r.text.clone()),
-            LineKind::Add => adds.push(r.text.clone()),
+            LineKind::Del => dels.push((r.text.clone(), r.old_lineno)),
+            LineKind::Add => adds.push((r.text.clone(), r.new_lineno)),
             LineKind::Ctx => {
                 flush(&mut out, &mut dels, &mut adds);
                 out.push(RenderRow::SplitLine {
-                    left: Some((LineKind::Ctx, r.text.clone())),
-                    right: Some((LineKind::Ctx, r.text.clone())),
+                    left: Some((LineKind::Ctx, r.text.clone(), r.old_lineno)),
+                    right: Some((LineKind::Ctx, r.text.clone(), r.new_lineno)),
                 });
             }
         }
@@ -1598,22 +1677,35 @@ fn split_align(rows: &[diff::DiffLineRow]) -> Vec<RenderRow> {
 fn split_cell(
     ui: &mut egui::Ui,
     kind: Option<LineKind>,
+    lineno: Option<u32>,
+    lineno_width: usize,
     spans: &[(Color32, String)],
     selected: Option<&str>,
 ) -> Option<String> {
-    let (bg, gutter) = match kind {
-        Some(LineKind::Add) => (Some(Color32::from_rgb(22, 50, 22)), "+ "),
-        Some(LineKind::Del) => (Some(Color32::from_rgb(55, 22, 22)), "- "),
-        Some(LineKind::Ctx) => (None, "  "),
-        None => (Some(Color32::from_rgb(28, 28, 30)), "  "), // empty filler
+    let (bg, marker) = match kind {
+        Some(LineKind::Add) => (Some(Color32::from_rgb(22, 50, 22)), '+'),
+        Some(LineKind::Del) => (Some(Color32::from_rgb(55, 22, 22)), '-'),
+        Some(LineKind::Ctx) => (None, ' '),
+        None => (Some(Color32::from_rgb(28, 28, 30)), ' '), // empty filler
     };
+    // One line-number column (old on the left side, new on the right) + marker.
+    let gutter = format!("{} {} ", fmt_lineno(lineno, lineno_width), marker);
     if let Some(bg) = bg {
         egui::Frame::none()
             .fill(bg)
-            .show(ui, |ui| line_row(ui, gutter, spans, selected, true))
+            .show(ui, |ui| line_row(ui, &gutter, spans, selected, true))
             .inner
     } else {
-        line_row(ui, gutter, spans, selected, true)
+        line_row(ui, &gutter, spans, selected, true)
+    }
+}
+
+/// Format a line number right-aligned to `width` digits, or blank (spaces) if
+/// there's no number for this row/side (e.g. the old number on an added line).
+fn fmt_lineno(n: Option<u32>, width: usize) -> String {
+    match n {
+        Some(v) => format!("{v:>width$}"),
+        None => " ".repeat(width),
     }
 }
 
@@ -1912,7 +2004,12 @@ mod ui_tests {
     }
 
     fn row(kind: LineKind, t: &str) -> diff::DiffLineRow {
-        diff::DiffLineRow { kind, text: t.into() }
+        diff::DiffLineRow {
+            kind,
+            text: t.into(),
+            old_lineno: None,
+            new_lineno: None,
+        }
     }
 
     #[test]
@@ -1949,7 +2046,8 @@ mod ui_tests {
         let cell = |r: &RenderRow, side: usize| -> Option<(LineKind, String)> {
             match r {
                 RenderRow::SplitLine { left, right } => {
-                    if side == 0 { left.clone() } else { right.clone() }
+                    let c = if side == 0 { left } else { right };
+                    c.as_ref().map(|(k, t, _)| (*k, t.clone()))
                 }
                 _ => None,
             }
