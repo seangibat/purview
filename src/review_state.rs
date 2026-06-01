@@ -124,16 +124,6 @@ impl ComparisonKey {
             }
         }
     }
-
-    /// The human-readable range label the GUI stores in `ReviewState.range`.
-    /// Used by migration to tell which comparison an old single-file state
-    /// belonged to. MUST stay in sync with `main.rs`'s `range` string.
-    pub fn range_label(&self) -> String {
-        match self {
-            ComparisonKey::WorkingTree => "working tree vs HEAD".to_string(),
-            ComparisonKey::BranchRange { base } => format!("{base}...HEAD"),
-        }
-    }
 }
 
 /// Sanitize a string into a safe filename component: alnum/._- kept, all else
@@ -314,20 +304,8 @@ impl ReviewState {
                 return Some(state);
             }
         }
-        // Migration: import the old single-file layout if it matches.
-        let old = Self::path_for(repo_root);
-        if let Ok(raw) = std::fs::read_to_string(&old) {
-            if let Ok(state) = serde_json::from_str::<Self>(&raw) {
-                if state.range == key.range_label() {
-                    // Persist into the new layout, then sideline the old file so
-                    // it's not re-imported (and a later comparison switch can't
-                    // mistake it for that comparison).
-                    let _ = state.save_for_comparison(repo_root, key);
-                    let _ = std::fs::rename(&old, old.with_extension("json.bak"));
-                    return Some(state);
-                }
-            }
-        }
+        // Legacy single-file review state is intentionally NOT imported (per
+        // Sean): a comparison with no per-comparison file starts fresh.
         None
     }
 
@@ -656,46 +634,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- Migration --------------------------------------------------------
-
     #[test]
-    fn old_single_file_is_migrated_into_new_layout() {
-        let dir = tmp_dir("migrate");
-        // Write an OLD-format file at the canonical path. (sample()'s range is
-        // "main...HEAD", so it migrates under the main__HEAD comparison.)
+    fn legacy_single_file_is_not_imported() {
+        let dir = tmp_dir("no-migrate");
+        // An OLD-format file at the canonical path must NOT be imported — per
+        // Sean, legacy review state isn't carried forward.
         sample().save(&dir).unwrap();
-        let old_path = ReviewState::path_for(&dir);
-        assert!(old_path.exists());
-
         let key = ComparisonKey::BranchRange { base: "main".into() };
-        // The new per-comparison file doesn't exist yet.
-        assert!(!ReviewState::path_for_comparison(&dir, &key).exists());
-
-        // Loading the comparison imports the old file without loss.
-        let migrated = ReviewState::load_for_comparison(&dir, &key)
-            .expect("old file should migrate");
-        assert_eq!(migrated.files.len(), 1);
-        assert_eq!(migrated.files[0].hunks.len(), 3);
-        assert_eq!(migrated.files[0].hunks[1].comment.as_deref(), Some("why"));
-        assert_eq!(migrated.files[0].hunks[0].status, "approved");
-
-        // The new file now exists; the old one was renamed to .bak (preserved).
-        assert!(ReviewState::path_for_comparison(&dir, &key).exists());
-        assert!(!old_path.exists(), "old file renamed");
-        assert!(old_path.with_extension("json.bak").exists(), "old file preserved as .bak");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migration_skips_when_range_does_not_match() {
-        let dir = tmp_dir("migrate-skip");
-        // Old file describes main...HEAD.
-        sample().save(&dir).unwrap();
-        // Loading a DIFFERENT comparison must not import it.
-        let dev_key = ComparisonKey::BranchRange { base: "develop".into() };
-        assert!(ReviewState::load_for_comparison(&dir, &dev_key).is_none());
-        // The old file is left untouched (not renamed).
-        assert!(ReviewState::path_for(&dir).exists());
+        assert!(
+            ReviewState::load_for_comparison(&dir, &key).is_none(),
+            "legacy single-file state must not migrate"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
