@@ -382,6 +382,11 @@ struct App {
     /// height, captured each frame so PageUp/PageDown can move by a page.
     content_scroll: f32,
     content_viewport_h: f32,
+    /// The content pane's ACTUAL total rendered height last frame (egui's
+    /// `content_size.y`). Used by PageUp/PageDown instead of `rows × row_h`,
+    /// which under-estimates with variable-height rows and stops paging short
+    /// of the real end of a long file.
+    content_height: f32,
     /// The cache-row range egui ACTUALLY painted in the content area last frame
     /// (from `show_rows`' `range`), as an inclusive `[first, last]`. This is the
     /// real visible window — it accounts for variable row heights, unlike the
@@ -461,6 +466,7 @@ impl App {
             last_open_path: None,
             content_scroll: 0.0,
             content_viewport_h: 0.0,
+            content_height: 0.0,
             visible_rows: None,
             orphaned: Vec::new(),
         };
@@ -1529,8 +1535,15 @@ impl App {
             )
         });
         if page_up || page_down {
-            let content_h = self.cache.len() as f32
-                * (ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0);
+            // Use the real rendered content height (variable row heights) when
+            // we have it; fall back to the row-count estimate on the very first
+            // frame before any render has reported a size.
+            let content_h = if self.content_height > 0.0 {
+                self.content_height
+            } else {
+                self.cache.len() as f32
+                    * (ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0)
+            };
             let off = page_scroll(
                 self.content_scroll,
                 self.content_viewport_h,
@@ -2393,6 +2406,9 @@ impl App {
             );
             content_scroll = out.state.offset.y;
             content_viewport_h = out.inner_rect.height();
+            // Real total content height (handles variable row heights) so
+            // PageDown can reach the true bottom of a long file.
+            self.content_height = out.content_size.y;
             if let Some(pr) = painted {
                 self.visible_rows = Some(pr);
             }
