@@ -1871,42 +1871,49 @@ impl App {
                 .max_width(pane_w)
                 .vertical_scroll_offset(v_off)
                 .show_rows(ui, row_h, total, |ui, range| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for i in range {
-                        match &self.cache[i] {
-                            RenderRow::SplitLine { left, .. } => {
-                                let kind = left.as_ref().map(|(k, _, _)| *k);
-                                let lno = left.as_ref().and_then(|(_, _, n)| *n);
-                                let (lspans, _) = self.split_spans(i);
-                                if let Some(s) =
-                                    split_cell(ui, kind, lno, lineno_w, &lspans, sel)
-                                {
-                                    *clicked_symbol = Some(s);
+                    // Force a top-down layout: this ScrollArea lives inside the
+                    // `horizontal_top` that lays the two panes side by side, so
+                    // its content_ui inherits a LEFT-TO-RIGHT direction. Without
+                    // this, every row would flow onto one line instead of
+                    // stacking (the Full+Split "all on one line" regression).
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for i in range {
+                            match &self.cache[i] {
+                                RenderRow::SplitLine { left, .. } => {
+                                    let kind = left.as_ref().map(|(k, _, _)| *k);
+                                    let lno = left.as_ref().and_then(|(_, _, n)| *n);
+                                    let (lspans, _) = self.split_spans(i);
+                                    if let Some(s) =
+                                        split_cell(ui, kind, lno, lineno_w, &lspans, sel)
+                                    {
+                                        *clicked_symbol = Some(s);
+                                    }
+                                }
+                                RenderRow::HunkHeader { text, .. } => {
+                                    // The header strip itself (controls live in
+                                    // the unified path; here in Split we just
+                                    // show its label so the row exists/aligns).
+                                    egui::Frame::none()
+                                        .fill(Color32::from_rgb(30, 36, 48))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(if text.is_empty() {
+                                                    " "
+                                                } else {
+                                                    text
+                                                })
+                                                .monospace()
+                                                .color(Color32::from_rgb(120, 160, 220)),
+                                            );
+                                        });
+                                }
+                                _ => {
+                                    ui.label(" ");
                                 }
                             }
-                            RenderRow::HunkHeader { text, .. } => {
-                                // The header strip itself (controls live in the
-                                // unified path; here in Split we just show its
-                                // label so the row exists and aligns).
-                                egui::Frame::none()
-                                    .fill(Color32::from_rgb(30, 36, 48))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(if text.is_empty() {
-                                                " "
-                                            } else {
-                                                text
-                                            })
-                                            .monospace()
-                                            .color(Color32::from_rgb(120, 160, 220)),
-                                        );
-                                    });
-                            }
-                            _ => {
-                                ui.label(" ");
-                            }
                         }
-                    }
+                    });
                 });
             // The user's vertical drag on the left pane wins this frame.
             if (left.state.offset.y - v_off).abs() > 0.5 {
@@ -1923,31 +1930,35 @@ impl App {
                 .max_width(pane_w)
                 .vertical_scroll_offset(new_off)
                 .show_rows(ui, row_h, total, |ui, range| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for i in range {
-                        match &self.cache[i] {
-                            RenderRow::SplitLine { right, .. } => {
-                                let kind = right.as_ref().map(|(k, _, _)| *k);
-                                let rno = right.as_ref().and_then(|(_, _, n)| *n);
-                                let (_, rspans) = self.split_spans(i);
-                                if let Some(s) =
-                                    split_cell(ui, kind, rno, lineno_w, &rspans, sel)
-                                {
-                                    *clicked_symbol = Some(s);
+                    // Same top-down guard as the left pane (see note above):
+                    // keep rows stacking vertically inside the horizontal layout.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for i in range {
+                            match &self.cache[i] {
+                                RenderRow::SplitLine { right, .. } => {
+                                    let kind = right.as_ref().map(|(k, _, _)| *k);
+                                    let rno = right.as_ref().and_then(|(_, _, n)| *n);
+                                    let (_, rspans) = self.split_spans(i);
+                                    if let Some(s) =
+                                        split_cell(ui, kind, rno, lineno_w, &rspans, sel)
+                                    {
+                                        *clicked_symbol = Some(s);
+                                    }
+                                }
+                                RenderRow::HunkHeader { .. } => {
+                                    egui::Frame::none()
+                                        .fill(Color32::from_rgb(30, 36, 48))
+                                        .show(ui, |ui| {
+                                            ui.label(egui::RichText::new(" ").monospace());
+                                        });
+                                }
+                                _ => {
+                                    ui.label(" ");
                                 }
                             }
-                            RenderRow::HunkHeader { .. } => {
-                                egui::Frame::none()
-                                    .fill(Color32::from_rgb(30, 36, 48))
-                                    .show(ui, |ui| {
-                                        ui.label(egui::RichText::new(" ").monospace());
-                                    });
-                            }
-                            _ => {
-                                ui.label(" ");
-                            }
                         }
-                    }
+                    });
                 });
             // A drag on the right pane also drives the shared offset.
             if (right.state.offset.y - new_off).abs() > 0.5 {
@@ -2405,6 +2416,134 @@ mod ui_tests {
             state.files.iter().flat_map(|f| &f.hunks).any(|h| h.status == "approved"),
             "the click should have persisted approved status to disk"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// REGRESSION GUARD (Full+Split "all on one line"): each split pane is a
+    /// `ScrollArea::both().show_rows` nested inside the `horizontal_top` that
+    /// places the two panes side by side. That parent's left-to-right direction
+    /// is inherited by the ScrollArea's content_ui, so without an explicit
+    /// `top_down` layout inside the row closure every row flows onto ONE line
+    /// instead of stacking. This test renders a pane exactly as `split_panes`
+    /// does and asserts the rows occupy DISTINCT vertical positions (one row
+    /// per cache line, height ≈ row_h) — it FAILS (all rows at the same y, x
+    /// marching rightward) if the top-down guard is removed.
+    #[test]
+    fn full_split_rows_stack_vertically_not_on_one_line() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.layout = Layout::Split;
+        app.extent = Extent::Full;
+        app.selected = Some(Selection::Changed(0));
+        app.ensure_cache();
+        assert!(app.cache.len() >= 8, "fixture should produce many split rows");
+
+        let row_h = 18.0;
+        let n = app.cache.len().min(10);
+        // (start_y, end_y, start_x) captured per row from the live layout.
+        let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Mirror split_panes' structure: a horizontal_top wrapping a
+                    // bidirectional ScrollArea with show_rows + the top_down
+                    // guard the fix installs.
+                    ui.horizontal_top(|ui| {
+                        egui::ScrollArea::both()
+                            .id_salt("test-left")
+                            .auto_shrink([false, false])
+                            .max_width(500.0)
+                            .show_rows(ui, row_h, n, |ui, range| {
+                                ui.with_layout(
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        for i in range {
+                                            // Where the NEXT row will be placed.
+                                            // Top-down: x fixed, y advances.
+                                            // Horizontal flow (the bug): y fixed,
+                                            // x marches rightward.
+                                            let cur = ui.cursor().min;
+                                            let before_y = cur.y;
+                                            let start_x = cur.x;
+                                            match &app.cache[i] {
+                                                RenderRow::SplitLine { left, .. } => {
+                                                    let kind =
+                                                        left.as_ref().map(|(k, _, _)| *k);
+                                                    let lno = left
+                                                        .as_ref()
+                                                        .and_then(|(_, _, no)| *no);
+                                                    let (ls, _) = app.split_spans(i);
+                                                    let _ = split_cell(
+                                                        ui,
+                                                        kind,
+                                                        lno,
+                                                        app.lineno_width,
+                                                        &ls,
+                                                        None,
+                                                    );
+                                                }
+                                                _ => {
+                                                    ui.label(" ");
+                                                }
+                                            }
+                                            let after_y = ui.cursor().min.y;
+                                            rows.push((before_y, after_y, start_x));
+                                        }
+                                    },
+                                );
+                            });
+                    });
+                });
+            },
+        );
+
+        assert_eq!(rows.len(), n, "captured one entry per rendered row");
+
+        // Each row must ADVANCE the vertical cursor by ~row_h (it occupies its
+        // own line). On the bug, every row sits at the same y (delta ~0) and
+        // the x-cursor marches rightward instead.
+        for (i, &(start_y, end_y, _)) in rows.iter().enumerate() {
+            let dy = end_y - start_y;
+            assert!(
+                dy >= row_h * 0.5,
+                "row {i} must occupy its own line (advanced dy={dy:.1}, want ≈{row_h}); \
+                 dy≈0 means rows collapsed onto one line"
+            );
+        }
+
+        // Rows must START at the same x (left margin), not march rightward —
+        // the tell-tale of horizontal flow. Allow a tiny tolerance.
+        let x0 = rows[0].2;
+        for (i, &(_, _, sx)) in rows.iter().enumerate() {
+            assert!(
+                (sx - x0).abs() < 2.0,
+                "row {i} must start at the left margin (x={sx:.1}, row0 x={x0:.1}); \
+                 a growing x means rows flowed left-to-right on one line"
+            );
+        }
+
+        // Total vertical extent should be ≈ n × row_h, not ≈ a single row.
+        let total_height = rows.last().unwrap().1 - rows[0].0;
+        assert!(
+            total_height >= row_h * (n as f32) * 0.5,
+            "stacked rows span ≈{} px; got only {total_height:.1} (collapsed)",
+            row_h * n as f32
+        );
+
+        // And the real app frame must render Full+Split without panicking.
+        let ctx2 = egui::Context::default();
+        frame(&ctx2, &mut app);
+
         let _ = std::fs::remove_dir_all(&repo);
     }
 
