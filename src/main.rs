@@ -72,6 +72,27 @@ struct QuickOpen {
     just_opened: bool,
 }
 
+/// In-file (Ctrl+F) search state. Some = the search bar is open.
+struct Search {
+    /// The current query text.
+    query: String,
+    /// Cache-row indices that match `query` (ascending), recomputed when the
+    /// query or the content cache changes.
+    matches: Vec<usize>,
+    /// Index INTO `matches` of the currently-selected match (for "k of N" and
+    /// next/prev). 0-based; clamped to `matches`.
+    current: usize,
+    /// True for the first frame so the input grabs focus.
+    just_opened: bool,
+    /// The (query, cache generation) the `matches` were computed for, so we
+    /// only recompute when something actually changed.
+    computed_for: Option<(String, u64)>,
+    /// The cache row we last scrolled the current match to, so we only issue a
+    /// scroll on an actual match change (next/prev/new query) — never every
+    /// frame, which would fight manual scrolling.
+    last_scrolled: Option<usize>,
+}
+
 /// How the diff is laid out.
 #[derive(Clone, Copy, PartialEq)]
 enum Layout {
@@ -216,6 +237,8 @@ struct App {
     loading: bool,
     /// Whether the `?` keybinding cheat-sheet overlay is showing.
     show_help: bool,
+    /// In-file (Ctrl+F) search state. Some = the search bar is open.
+    search: Option<Search>,
     /// The open file's path as of last frame, so the tree only auto-scrolls to
     /// the highlighted row when the open file actually changes (not every frame).
     last_open_path: Option<String>,
@@ -274,6 +297,7 @@ impl App {
             diff_rx: None,
             loading: false,
             show_help: false,
+            search: None,
             last_open_path: None,
             content_scroll: 0.0,
             content_viewport_h: 0.0,
@@ -1204,14 +1228,28 @@ impl App {
             self.focus_hunk = 0;
         }
 
-        // n/p: move the focused hunk + scroll to it.
+        // n/p: move to the next/prev hunk RELATIVE TO THE CURRENT SCROLL
+        // POSITION (not just focus_hunk ± 1) and scroll it into view. Anchoring
+        // on the viewport top row means n/p always target the hunk just below /
+        // above what's on screen, even when no hunk header is currently visible
+        // (the bug: stepping focus_hunk alone could jump to a hunk above the
+        // viewport, feeling like a page move).
         if (n || p) && !self.hunk_rows.is_empty() {
-            if n {
-                self.focus_hunk = (self.focus_hunk + 1).min(self.hunk_rows.len() - 1);
-            } else {
-                self.focus_hunk = self.focus_hunk.saturating_sub(1);
-            }
             let row_h = ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0;
+            let top_row = (self.content_scroll / row_h).floor().max(0.0) as usize;
+            // The last fully/partly visible cache row. viewport_h may be 0 on
+            // the very first frame; fall back to top_row so focus is treated as
+            // "visible" only when it's exactly at the top.
+            let visible_rows = (self.content_viewport_h / row_h).floor().max(0.0) as usize;
+            let bottom_row = top_row + visible_rows;
+            match nav_hunk_from_scroll(&self.hunk_rows, top_row, bottom_row, self.focus_hunk, n) {
+                Some(target) => self.focus_hunk = target,
+                // No hunk in that direction — clamp to the edge in this
+                // direction so a repeated press settles, never pages.
+                None => {
+                    self.focus_hunk = if n { self.hunk_rows.len() - 1 } else { 0 };
+                }
+            }
             let row = self.hunk_rows.get(self.focus_hunk).copied().unwrap_or(0);
             self.pending_scroll = Some(row as f32 * row_h);
         }
@@ -1234,6 +1272,120 @@ impl App {
             } else if c {
                 self.active_hunk = Some(self.focus_hunk);
             }
+        }
+    }
+
+    /// Render the Ctrl+F in-file search bar (when open) and handle its keys.
+    /// Recomputes the match set against the current content cache, advances on
+    /// Enter / F3 (next) and Shift+Enter / Shift+F3 (prev), shows a "k of N"
+    /// count, and scrolls the current match into view. Esc closes + clears.
+    /// Must run after `ensure_cache` (it reads `self.cache`) and before the
+    /// central panel (it sets `self.pending_scroll`, consumed there).
+    fn search_bar(&mut self, ctx: &egui::Context) {
+        if self.search.is_none() {
+            return;
+        }
+        // Esc closes the search and clears highlights.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.search = None;
+            return;
+        }
+        // Read next/prev intents before the text field consumes the keys.
+        // Enter / F3 → next; with Shift → previous. Ctrl+G also goes next
+        // (Ctrl+Shift+G previous) for editor-convention parity.
+        let (next, prev) = ctx.input(|i| {
+            let shift = i.modifiers.shift;
+            let enter = i.key_pressed(egui::Key::Enter);
+            let f3 = i.key_pressed(egui::Key::F3);
+            let ctrl_g = (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::G);
+            let fwd = (enter || f3 || ctrl_g) && !shift;
+            let back = (enter || f3 || ctrl_g) && shift;
+            (fwd, back)
+        });
+
+        let generation = self.generation;
+        let cache = &self.cache;
+        let Some(search) = self.search.as_mut() else { return };
+
+        // Recompute matches when the query or the content changed.
+        let key = (search.query.clone(), generation);
+        if search.computed_for.as_ref() != Some(&key) {
+            search.matches = find_matches(cache, &search.query);
+            search.computed_for = Some(key);
+            if search.current >= search.matches.len() {
+                search.current = 0;
+            }
+        }
+
+        let n = search.matches.len();
+        if n > 0 {
+            if next {
+                search.current = (search.current + 1) % n;
+            } else if prev {
+                search.current = (search.current + n - 1) % n;
+            } else if search.current >= n {
+                search.current = 0;
+            }
+        }
+
+        // Scroll the current match into view (a little headroom above it), but
+        // only when it actually changed — otherwise we'd re-scroll every frame
+        // and fight the user's manual scrolling.
+        let cur_row = if n > 0 {
+            search.matches.get(search.current).copied()
+        } else {
+            None
+        };
+        let scroll_to = if cur_row != search.last_scrolled {
+            search.last_scrolled = cur_row;
+            cur_row
+        } else {
+            None
+        };
+
+        let count_label = if search.query.trim().is_empty() {
+            String::new()
+        } else if n == 0 {
+            "no matches".to_string()
+        } else {
+            format!("{} of {}", search.current + 1, n)
+        };
+
+        let mut just_opened = search.just_opened;
+        egui::Window::new("Find")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 96.0])
+            .fixed_size([300.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut search.query)
+                            .hint_text("find in file…")
+                            .desired_width(180.0),
+                    );
+                    if just_opened {
+                        resp.request_focus();
+                        just_opened = false;
+                    }
+                    if !count_label.is_empty() {
+                        ui.label(egui::RichText::new(&count_label).small().weak());
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Enter/F3 next · Shift+Enter prev · Esc close")
+                        .small()
+                        .weak(),
+                );
+            });
+        search.just_opened = just_opened;
+
+        if let Some(row) = scroll_to {
+            let row_h = ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0;
+            // A few rows of headroom so the match isn't jammed at the very top.
+            let target = row.saturating_sub(3);
+            self.pending_scroll = Some(target as f32 * row_h);
         }
     }
 
@@ -1287,6 +1439,30 @@ impl App {
                 });
             }
         }
+        // Ctrl+F toggles the in-file search bar. (Cmd+F on mac.) When the bar
+        // is already open we always let it close — its own text field holds
+        // keyboard focus, so we must read the press here (before the widget) to
+        // catch it. When it's CLOSED we only open if no other text field (base
+        // input / comment box) currently has focus, so Ctrl+F never fires mid-
+        // typing elsewhere.
+        let toggle_find = ctx.input(|i| {
+            i.key_pressed(egui::Key::F) && (i.modifiers.ctrl || i.modifiers.command)
+        });
+        if toggle_find {
+            if self.search.is_some() {
+                self.search = None;
+            } else if !ctx.wants_keyboard_input() {
+                self.search = Some(Search {
+                    query: String::new(),
+                    matches: Vec::new(),
+                    current: 0,
+                    just_opened: true,
+                    computed_for: None,
+                    last_scrolled: None,
+                });
+            }
+        }
+
         self.quick_open_overlay(ctx);
         self.goto_overlay(ctx);
         self.handle_nav_keys(ctx);
@@ -1438,6 +1614,7 @@ impl App {
             });
 
         self.ensure_cache();
+        self.search_bar(ctx);
 
         // The file whose hunks the controls mutate (only in Changed+Diff).
         let active_file = match &self.selected {
@@ -1456,6 +1633,17 @@ impl App {
         let mut content_scroll = self.content_scroll;
         let mut content_viewport_h = self.content_viewport_h;
         let sel_sym = self.selected_symbol.clone();
+        // In-file search highlight set (Ctrl+F): the matched cache rows and the
+        // currently-selected one, captured for the render closure so it can tint
+        // matches. Empty when search is closed or the query is empty.
+        let (search_rows, search_current_row): (std::collections::HashSet<usize>, Option<usize>) =
+            match &self.search {
+                Some(s) if !s.matches.is_empty() => (
+                    s.matches.iter().copied().collect(),
+                    s.matches.get(s.current).copied(),
+                ),
+                _ => (std::collections::HashSet::new(), None),
+            };
         // Inline-edit state, pulled out so the render closure can mutate the
         // buffer while `self` is immutably borrowed for the cache.
         let edit_row = self.editing.as_ref().map(|(r, _)| *r);
@@ -1585,6 +1773,18 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let focus_row = self.hunk_rows.get(self.focus_hunk).copied();
                     for i in range {
+                        // Ctrl+F highlight: tint matched rows; the current match
+                        // gets a brighter band so next/prev is visible. Painted
+                        // as a TRANSLUCENT overlay after the row draws, so it
+                        // reads on top of the row's own add/del background.
+                        let search_tint = if Some(i) == search_current_row {
+                            Some(Color32::from_rgba_unmultiplied(230, 180, 60, 90))
+                        } else if search_rows.contains(&i) {
+                            Some(Color32::from_rgba_unmultiplied(230, 200, 90, 45))
+                        } else {
+                            None
+                        };
+                        let y_before = ui.cursor().min.y;
                         match &self.cache[i] {
                             RenderRow::HunkHeader { hunk_idx, text, whole_file } => {
                                 let focused = Some(i) == focus_row;
@@ -1774,6 +1974,16 @@ impl App {
                                     }
                                 });
                             }
+                        }
+                        // Overlay the search tint across the row just drawn.
+                        if let Some(tint) = search_tint {
+                            let y_after = ui.cursor().min.y;
+                            let h = (y_after - y_before).max(row_h);
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(ui.max_rect().min.x, y_before),
+                                egui::vec2(ui.max_rect().width(), h),
+                            );
+                            ui.painter().rect_filled(rect, 0.0, tint);
                         }
                     }
                 },
@@ -2056,6 +2266,7 @@ fn split_pane_width(available: f32, gap: f32) -> f32 {
 fn keybindings() -> &'static [(&'static str, &'static str)] {
     &[
         ("Ctrl+P", "fuzzy open file"),
+        ("Ctrl+F", "find in file (Enter/F3 next, Shift prev, Esc close)"),
         ("j / k", "next / prev changed file"),
         ("n / p", "next / prev hunk"),
         ("a / r", "approve / reject focused hunk"),
@@ -2067,6 +2278,85 @@ fn keybindings() -> &'static [(&'static str, &'static str)] {
         ("Ctrl 0", "reset zoom"),
         ("?", "this help (Esc to close)"),
     ]
+}
+
+/// Pick the n/p target hunk so n/p always move to the NEXT / PREVIOUS hunk
+/// relative to where the user is looking — never page the view. `hunk_rows` is
+/// the ascending list of each hunk header's cache-row index. `top_row` /
+/// `bottom_row` bracket the currently-visible cache rows. `focus` is the
+/// current focus hunk (index into `hunk_rows`). `forward` = `n`.
+///
+/// The anchor depends on whether the focused hunk is on screen:
+/// - If the focused hunk's header is WITHIN the viewport, step from it
+///   (`focus ± 1`) — the familiar "next/prev hunk" behavior.
+/// - If it has scrolled OFF screen (the user paged/scrolled into a large
+///   context region with no hunk header visible — the reported bug), anchor on
+///   the viewport instead: `n` → first hunk below the viewport top, `p` → last
+///   hunk above it. This stops n/p from jumping to a hunk on the wrong side of
+///   the viewport (which felt like paging).
+///
+/// Returns the index INTO `hunk_rows`, or `None` if there is no hunk in that
+/// direction (caller keeps / clamps the focus).
+fn nav_hunk_from_scroll(
+    hunk_rows: &[usize],
+    top_row: usize,
+    bottom_row: usize,
+    focus: usize,
+    forward: bool,
+) -> Option<usize> {
+    if hunk_rows.is_empty() {
+        return None;
+    }
+    let focus_visible = hunk_rows
+        .get(focus)
+        .map(|&r| r >= top_row && r <= bottom_row)
+        .unwrap_or(false);
+    if focus_visible {
+        // Step from the focused hunk (old, familiar behavior).
+        if forward {
+            (focus + 1 < hunk_rows.len()).then(|| focus + 1)
+        } else {
+            focus.checked_sub(1)
+        }
+    } else if forward {
+        // Focus is off-screen: first hunk below the viewport top.
+        hunk_rows.iter().position(|&r| r > top_row)
+    } else {
+        // Focus is off-screen: last hunk above the viewport top.
+        hunk_rows.iter().rposition(|&r| r < top_row)
+    }
+}
+
+/// The searchable text of one render row (Ctrl+F). Diff/plain lines contribute
+/// their content; a hunk header contributes its `@@ … @@` text; a split row
+/// contributes both cells joined by a space (so a match on either side counts).
+fn row_search_text(row: &RenderRow) -> String {
+    match row {
+        RenderRow::HunkHeader { text, .. } => text.clone(),
+        RenderRow::DiffLine { text, .. } => text.clone(),
+        RenderRow::Plain { text, .. } => text.clone(),
+        RenderRow::SplitLine { left, right } => {
+            let l = left.as_ref().map(|(_, t, _)| t.as_str()).unwrap_or("");
+            let r = right.as_ref().map(|(_, t, _)| t.as_str()).unwrap_or("");
+            format!("{l} {r}")
+        }
+    }
+}
+
+/// Find every render row whose text contains `query`, returning their indices
+/// in ascending (display) order. Case-insensitive. An empty/whitespace-only
+/// query matches nothing. This is the pure search core behind Ctrl+F; the count
+/// is just `result.len()`, and the "k of N" indicator uses position within it.
+fn find_matches(rows: &[RenderRow], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| row_search_text(r).to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// New vertical scroll offset after a Page Up/Down. `down` scrolls toward the
@@ -3203,13 +3493,117 @@ mod ui_tests {
         assert_eq!(page_scroll(0.0, 500.0, 100.0, true), 0.0);
     }
 
+    // ===================================================================
+    // n/p hunk navigation — must target the hunk relative to the current
+    // SCROLL position, never page the viewport (the reported bug).
+    // ===================================================================
+
+    /// When the focused hunk IS on screen, n/p step from it (the familiar
+    /// next/prev-hunk behavior). Hunk headers at cache rows 2, 8, 15; a 12-row
+    /// viewport at the top shows hunks 0 and 1.
+    #[test]
+    fn nav_hunk_steps_from_focus_when_visible() {
+        let rows = [2usize, 8, 15];
+        // Viewport rows 0..=12 → focus hunk 0 (row 2) is visible.
+        // n steps to hunk 1, p clamps (no hunk before 0).
+        assert_eq!(nav_hunk_from_scroll(&rows, 0, 12, 0, true), Some(1));
+        assert_eq!(nav_hunk_from_scroll(&rows, 0, 12, 0, false), None);
+        // Focus hunk 1 (row 8) visible → n to hunk 2, p to hunk 0.
+        assert_eq!(nav_hunk_from_scroll(&rows, 0, 12, 1, true), Some(2));
+        assert_eq!(nav_hunk_from_scroll(&rows, 0, 12, 1, false), Some(0));
+        // Focus on the last hunk (visible) → n clamps (nothing after).
+        assert_eq!(nav_hunk_from_scroll(&rows, 8, 20, 2, true), None);
+        assert_eq!(nav_hunk_from_scroll(&rows, 8, 20, 2, false), Some(1));
+    }
+
+    /// THE BUG: the viewport is scrolled into a large context region BETWEEN
+    /// hunks, so the FOCUSED hunk's header is off-screen (no hunk header
+    /// visible). n/p must anchor on the viewport — `n` → first hunk below the
+    /// viewport top, `p` → last hunk above it — NOT step blindly from the stale
+    /// focus (which would jump to a hunk on the wrong side, feeling like paging).
+    #[test]
+    fn nav_hunk_between_hunks_anchors_on_viewport() {
+        // Hunks far apart; viewport rows 50..=62 sit in the gap between the
+        // hunk at row 5 and the hunk at row 80. Focus is the STALE hunk 0
+        // (row 5), now scrolled off above the viewport.
+        let rows = [5usize, 80, 120];
+        assert_eq!(
+            nav_hunk_from_scroll(&rows, 50, 62, 0, true),
+            Some(1),
+            "n from a between-hunks position selects the first hunk BELOW the viewport, \
+             not focus+1 which would still be the off-screen hunk 1's neighbor"
+        );
+        assert_eq!(
+            nav_hunk_from_scroll(&rows, 50, 62, 0, false),
+            Some(0),
+            "p from a between-hunks position selects the first hunk ABOVE the viewport"
+        );
+        // Scrolled deep past the last hunk (rows 200..=212), focus stale at 0:
+        // p → last hunk, n → none (clamp handled by the caller).
+        assert_eq!(nav_hunk_from_scroll(&rows, 200, 212, 0, false), Some(2));
+        assert_eq!(nav_hunk_from_scroll(&rows, 200, 212, 0, true), None);
+        // Empty hunk list → no target either way.
+        assert_eq!(nav_hunk_from_scroll(&[], 0, 10, 0, true), None);
+        assert_eq!(nav_hunk_from_scroll(&[], 0, 10, 0, false), None);
+    }
+
+    // ===================================================================
+    // Ctrl+F in-file search — pure match-finding core.
+    // ===================================================================
+
+    /// `find_matches` returns the matching rows in display order; the count is
+    /// just the result length. Covers multiple matches, no matches, and
+    /// case-insensitivity, across the different RenderRow kinds.
+    #[test]
+    fn find_matches_returns_ordered_positions_and_count() {
+        let rows = vec![
+            RenderRow::HunkHeader {
+                hunk_idx: 0,
+                text: "@@ -1,3 +1,4 @@ fn Foo()".into(),
+                whole_file: false,
+            },
+            RenderRow::Plain { text: "let foo = 1;".into(), lineno: 1 },
+            RenderRow::DiffLine {
+                kind: LineKind::Add,
+                text: "    FOO.bar();".into(),
+                old_lineno: None,
+                new_lineno: Some(2),
+            },
+            RenderRow::Plain { text: "let baz = 2;".into(), lineno: 3 },
+            RenderRow::SplitLine {
+                left: Some((LineKind::Del, "old line".into(), Some(4))),
+                right: Some((LineKind::Add, "contains FoObar".into(), Some(4))),
+            },
+        ];
+
+        // Case-insensitive "foo" matches rows 0 (header), 1 (plain), 2 (diff),
+        // and 4 (split right cell) — in ascending order.
+        let m = find_matches(&rows, "foo");
+        assert_eq!(m, vec![0, 1, 2, 4], "ordered, case-insensitive matches");
+        assert_eq!(m.len(), 4, "the count is the match-list length");
+
+        // A different query hits a single row.
+        assert_eq!(find_matches(&rows, "baz"), vec![3]);
+
+        // No matches → empty.
+        assert!(find_matches(&rows, "nonexistent").is_empty());
+
+        // Empty / whitespace query matches nothing (so the bar isn't a no-op
+        // full highlight).
+        assert!(find_matches(&rows, "").is_empty());
+        assert!(find_matches(&rows, "   ").is_empty());
+
+        // Mixed-case query, lowercase content → still matches (case-insensitive).
+        assert_eq!(find_matches(&rows, "OLD LINE"), vec![4]);
+    }
+
     /// The cheat-sheet lists the bindings the code actually handles. Lock in a
     /// few load-bearing ones so the help can't silently drift.
     #[test]
     fn keybindings_cover_the_real_bindings() {
         let kb = keybindings();
         let keys: Vec<&str> = kb.iter().map(|(k, _)| *k).collect();
-        for k in ["Ctrl+P", "j / k", "n / p", "a / r", "F12", "g", "?"] {
+        for k in ["Ctrl+P", "Ctrl+F", "j / k", "n / p", "a / r", "F12", "g", "?"] {
             assert!(keys.contains(&k), "help must list {k:?}");
         }
         assert!(
@@ -3279,6 +3673,52 @@ mod ui_tests {
             after >= before,
             "PageDown should not move the view backward (before {before}, after {after})"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Ctrl+F opens the in-file search bar; typing a query that occurs in the
+    /// file populates the live match set; Esc closes it and clears the matches.
+    /// Driven through `app.ui` with the kittest harness so it exercises the real
+    /// key handling + match wiring (not just the pure helper).
+    #[test]
+    fn ctrl_f_opens_search_and_finds_matches() {
+        let repo = multi_hunk_repo(); // file lines "line N", with two edits
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full; // whole file shown → "line" appears many times
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        assert!(harness.state().search.is_none(), "search starts closed");
+
+        // Ctrl+F opens the bar (press_key has no modifier variant; set the
+        // modifier state and push the Key event with CTRL held directly).
+        harness.input_mut().modifiers = egui::Modifiers::CTRL;
+        for pressed in [true, false] {
+            harness.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::F,
+                pressed,
+                modifiers: egui::Modifiers::CTRL,
+                repeat: false,
+                physical_key: None,
+            });
+        }
+        harness.run();
+        harness.input_mut().modifiers = egui::Modifiers::default();
+        assert!(harness.state().search.is_some(), "Ctrl+F opens the search bar");
+
+        // Type a query directly into the state (the field has focus; we set the
+        // buffer to keep the test independent of per-char text events), then run
+        // a frame so search_bar recomputes the matches.
+        harness.state_mut().search.as_mut().unwrap().query = "line".to_string();
+        harness.run();
+        let n = harness.state().search.as_ref().unwrap().matches.len();
+        assert!(n > 1, "‘line’ should match many rows in the full file (got {n})");
+
+        // Esc closes + clears.
+        harness.press_key(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().search.is_none(), "Esc closes the search bar");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
