@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::diff::{self, ChangedFile, DiffSource};
+use crate::gotodef::Candidate;
 
 use super::{DirEntry, RepoSource};
 
@@ -196,6 +197,47 @@ impl SshRepo {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Like [`run_remote`] but pipes `input` to the remote command's stdin.
+    /// Used for write-back: the file content goes over stdin (so it never needs
+    /// shell-quoting), and the remote `cat > tmp && mv tmp dst` does the write.
+    fn run_remote_stdin(&self, remote_cmd: &str, input: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut child = Command::new("ssh")
+            .args(self.mux_opts())
+            .args(port_arg(&self.target))
+            .arg(self.target.destination())
+            .arg(remote_cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("ssh exec failed: {e}"))?;
+        // Take stdin and write in a scope so it's dropped (closed) before we
+        // wait — otherwise the remote `cat` blocks for EOF and we deadlock.
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "ssh: could not open stdin".to_string())?;
+            stdin
+                .write_all(input)
+                .map_err(|e| format!("ssh: failed writing remote file: {e}"))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("ssh exec failed: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "remote write failed: {}",
+                err.trim().lines().next().unwrap_or("(no stderr)")
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve the merge-base tree-ish for BranchRange (mirrors LocalRepo:
     /// `base...HEAD` three-dot semantics). Returns the rev to `git show` the
     /// base side from, plus the diff command's range argument.
@@ -341,18 +383,56 @@ impl RepoSource for SshRepo {
         "main".to_string()
     }
 
-    fn write_line(&self, _rel: &str, _line0: usize, _new_text: &str) -> Result<(), String> {
-        Err("inline editing is disabled in ssh mode (v1 is read-only)".into())
+    fn write_line(&self, rel: &str, line0: usize, new_text: &str) -> Result<(), String> {
+        // Read the remote file, apply the single-line edit locally with the
+        // SAME helper LocalRepo uses (identical semantics + trailing-newline
+        // handling), then write the whole file back atomically.
+        let content = self.read_file(rel)?;
+        let out = diff::replace_nth_line(&content, line0, new_text)
+            .ok_or_else(|| "line out of range".to_string())?;
+        let remote_path = format!("{}/{}", self.target.path, rel);
+        let quoted = shell_quote(&remote_path);
+        let tmp = shell_quote(&format!("{remote_path}.purview.tmp"));
+        // Atomic on the remote: stream the new content into a temp file, then
+        // mv it over the original (rename is atomic within a filesystem) so a
+        // concurrent reader never sees a half-written file. Content arrives on
+        // ssh's stdin so it never has to be shell-quoted.
+        let remote_cmd = format!("cat > {tmp} && mv {tmp} {quoted}");
+        self.run_remote_stdin(&remote_cmd, out.as_bytes())
+    }
+
+    fn grep_symbol(&self, symbol: &str) -> Result<Vec<Candidate>, String> {
+        // Same identifier-ish guard the local path applies, so we never send a
+        // shell/regex-hostile token to the remote.
+        if !crate::gotodef::is_safe_symbol(symbol) {
+            return Ok(Vec::new());
+        }
+        // git grep on the REMOTE, then parse the same `path:line:code` text the
+        // local backend parses. `--untracked` so brand-new files are searched.
+        // git grep exits non-zero with no matches; treat that as "no
+        // candidates" rather than an error.
+        let args = [
+            "grep",
+            "-n",
+            "-w",
+            "--untracked",
+            "--",
+            symbol,
+        ];
+        match self.run_git(&args) {
+            Ok(out) => Ok(crate::gotodef::parse_grep_output(&out)),
+            Err(_) => Ok(Vec::new()),
+        }
     }
 
     fn supports_editing(&self) -> bool {
-        false
+        true
     }
 
     fn supports_goto(&self) -> bool {
-        // git grep + Claude CLI run locally against the workdir; not wired for
-        // remote in v1. Disable rather than mislead.
-        false
+        // git grep runs on the remote (grep_symbol); the Claude-CLI precision
+        // step runs locally where purview runs.
+        true
     }
 
     fn label(&self) -> String {

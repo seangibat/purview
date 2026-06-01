@@ -612,24 +612,51 @@ impl App {
         if symbol.trim().is_empty() {
             return;
         }
-        // Go-to-definition (git grep + Claude CLI) runs against a local
-        // workdir; not supported over SSH in v1. Disable with a clear note.
+        // Go-to-definition is gated per backend (always on now: local runs git
+        // grep on the workdir, ssh runs it on the remote). Keep the guard so a
+        // future read-only backend can still opt out cleanly.
         if !self.repo.supports_goto() {
             self.goto = Some(Goto {
                 query: symbol,
                 just_opened: false,
                 resolving: false,
                 rx: None,
-                note: "go-to-definition is disabled in ssh mode (v1)".to_string(),
+                note: "go-to-definition is not supported for this repo".to_string(),
             });
             return;
         }
         let symbol = symbol.trim().to_string();
-        let root = self.state_root.clone();
+        // Candidate-gathering (git grep) must run WHERE the repo lives, so it
+        // goes through the repo backend on this (main) thread — it's fast.
+        let cands = match self.repo.grep_symbol(&symbol) {
+            Ok(c) => c,
+            Err(e) => {
+                self.goto = Some(Goto {
+                    query: symbol,
+                    just_opened: false,
+                    resolving: false,
+                    rx: None,
+                    note: format!("grep failed: {e}"),
+                });
+                return;
+            }
+        };
+        if cands.is_empty() {
+            self.goto = Some(Goto {
+                query: symbol,
+                just_opened: false,
+                resolving: false,
+                rx: None,
+                note: "no candidates found".to_string(),
+            });
+            return;
+        }
+        // The Claude-CLI precision step always runs LOCALLY (claude isn't on
+        // the remote), so spawn it on a background thread with the candidates.
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_symbol = symbol.clone();
         std::thread::spawn(move || {
-            let res = purview::gotodef::find_definition(&root, &worker_symbol, None);
+            let res = purview::gotodef::resolve_with_claude(&worker_symbol, None, &cands);
             let _ = tx.send(res);
         });
         self.goto = Some(Goto {

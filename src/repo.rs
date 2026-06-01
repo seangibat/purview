@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::diff::{self, ChangedFile, DiffSource};
+use crate::gotodef::Candidate;
 
 mod ssh;
 pub use ssh::{SshRepo, SshTarget};
@@ -67,6 +68,13 @@ pub trait RepoSource {
     /// Write `new_text` over 0-based line `line0` of `rel`, preserving the
     /// rest of the file. Inline-edit write-back.
     fn write_line(&self, rel: &str, line0: usize, new_text: &str) -> Result<(), String>;
+
+    /// `git grep -n -w <symbol>` for go-to-definition candidates, run WHERE the
+    /// repo lives (locally for [`LocalRepo`], on the remote for [`SshRepo`]).
+    /// Returns the same [`Candidate`] set `gotodef` then feeds to the LOCAL
+    /// Claude-CLI precision step. Identifier-ish symbols only (the caller and
+    /// each impl guard against shell/regex surprises).
+    fn grep_symbol(&self, symbol: &str) -> Result<Vec<Candidate>, String>;
 
     /// Whether inline editing (write-back) is supported. The UI hides/disables
     /// the edit affordance and shows a note when false.
@@ -177,6 +185,11 @@ impl RepoSource for LocalRepo {
         let tmp = path.with_extension("purview-tmp");
         std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    }
+
+    fn grep_symbol(&self, symbol: &str) -> Result<Vec<Candidate>, String> {
+        // Unchanged local behavior: git grep against the workdir.
+        Ok(crate::gotodef::grep_candidates(&self.root, symbol))
     }
 
     fn label(&self) -> String {
