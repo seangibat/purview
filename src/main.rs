@@ -378,6 +378,9 @@ struct App {
     /// The open file's path as of last frame, so the tree only auto-scrolls to
     /// the highlighted row when the open file actually changes (not every frame).
     last_open_path: Option<String>,
+    /// The file open when a reload/refresh started, so the fresh diff can
+    /// re-select it instead of snapping back to the first changed file.
+    reopen_after_reload: Option<String>,
     /// Last-known vertical scroll offset of the content pane + its viewport
     /// height, captured each frame so PageUp/PageDown can move by a page.
     content_scroll: f32,
@@ -464,6 +467,7 @@ impl App {
             show_help: false,
             search: None,
             last_open_path: None,
+            reopen_after_reload: None,
             content_scroll: 0.0,
             content_viewport_h: 0.0,
             content_height: 0.0,
@@ -502,6 +506,9 @@ impl App {
             self.save_review_state();
             self.comment_dirty = false;
         }
+        // Remember the open file so the fresh diff re-selects it instead of
+        // snapping back to the first changed file (refresh updates in place).
+        self.reopen_after_reload = self.open_path();
         self.files.clear();
         self.selected = None;
         self.active_hunk = None;
@@ -599,8 +606,19 @@ impl App {
                     self.orphaned = Vec::new();
                 }
                 self.files = files;
+                // Re-select the file that was open before the refresh, if it's
+                // still in the diff; otherwise fall back to the first changed
+                // file. Preserves the reviewer's place across a refresh.
+                let reopen = self.reopen_after_reload.take();
                 self.selected = if self.files.is_empty() {
-                    None
+                    reopen.map(Selection::Path)
+                } else if let Some(p) = reopen {
+                    match self.files.iter().position(|f| f.path == p) {
+                        Some(i) => Some(Selection::Changed(i)),
+                        // Was an unchanged tree file (or no longer changed) —
+                        // keep showing it as a full-file view.
+                        None => Some(Selection::Path(p)),
+                    }
                 } else {
                     Some(Selection::Changed(0))
                 };
