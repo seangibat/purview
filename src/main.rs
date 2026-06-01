@@ -2069,6 +2069,11 @@ impl App {
                     pending_v,
                     sel_sym.as_deref(),
                     &mut clicked_symbol,
+                    active_file,
+                    active_path.as_deref(),
+                    &replies,
+                    &mut pending,
+                    &mut open_comment,
                 );
                 content_scroll = off;
                 content_viewport_h = vp;
@@ -2102,110 +2107,20 @@ impl App {
                         match &self.cache[i] {
                             RenderRow::HunkHeader { hunk_idx, text, whole_file } => {
                                 let focused = Some(i) == focus_row;
-                                // Which review hunks this control strip targets:
-                                // exactly `hunk_idx` in Summary, or ALL of the
-                                // file's hunks in Full extent (where the shown
-                                // content is one full-file hunk).
-                                let targets: Vec<usize> = match active_file {
-                                    Some(f) if *whole_file => {
-                                        (0..self.files[f].hunks.len()).collect()
-                                    }
-                                    Some(_) => vec![*hunk_idx],
-                                    None => Vec::new(),
-                                };
-                                // Aggregate status across the targeted hunks: a
-                                // single hunk shows its own status; the whole-
-                                // file strip shows all-approved / all-rejected /
-                                // else unreviewed (mixed reads as "needs work").
-                                let status = active_file
-                                    .map(|f| aggregate_status(&self.files[f], &targets))
-                                    .unwrap_or(ReviewStatus::Unreviewed);
-                                let hdr_bg = if focused {
-                                    Color32::from_rgb(48, 58, 80) // focused: brighter
-                                } else {
-                                    Color32::from_rgb(30, 36, 48)
-                                };
-                                egui::Frame::none()
-                                    .fill(hdr_bg)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            // Always reserve the focus-marker
-                                            // column so toggling focus doesn't
-                                            // reflow the row (bug 3 layout shift).
-                                            ui.label(
-                                                egui::RichText::new(if focused {
-                                                    "▶"
-                                                } else {
-                                                    " "
-                                                })
-                                                .monospace()
-                                                .color(Color32::from_rgb(140, 180, 240)),
-                                            );
-                                            let (glyph, col) = match status {
-                                                ReviewStatus::Approved => {
-                                                    ("✓", Color32::from_rgb(120, 200, 120))
-                                                }
-                                                ReviewStatus::Rejected => {
-                                                    ("✗", Color32::from_rgb(220, 120, 120))
-                                                }
-                                                ReviewStatus::Unreviewed => {
-                                                    ("○", Color32::DARK_GRAY)
-                                                }
-                                            };
-                                            ui.label(egui::RichText::new(glyph).color(col));
-                                            if ui.small_button("approve").clicked() {
-                                                for &t in &targets {
-                                                    pending.push((t, ReviewStatus::Approved));
-                                                }
-                                            }
-                                            if ui.small_button("reject").clicked() {
-                                                for &t in &targets {
-                                                    pending.push((t, ReviewStatus::Rejected));
-                                                }
-                                            }
-                                            // Always render "clear" (disabled
-                                            // when nothing to clear) so the row
-                                            // never reflows when status toggles
-                                            // (bug 3 layout shift).
-                                            if ui
-                                                .add_enabled(
-                                                    status != ReviewStatus::Unreviewed,
-                                                    egui::Button::new("clear").small(),
-                                                )
-                                                .clicked()
-                                            {
-                                                for &t in &targets {
-                                                    pending.push((t, ReviewStatus::Unreviewed));
-                                                }
-                                            }
-                                            let has_comment = active_file
-                                                .and_then(|f| self.files[f].hunks.get(*hunk_idx))
-                                                .map(|h| !h.comment.trim().is_empty())
-                                                .unwrap_or(false);
-                                            let cbtn = if has_comment { "💬*" } else { "💬" };
-                                            if ui.small_button(cbtn).clicked() {
-                                                open_comment = Some(*hunk_idx);
-                                            }
-                                            // Agent-reply count for this hunk.
-                                            if let Some(p) = &active_path {
-                                                let n = replies.for_hunk(p, text).len();
-                                                if n > 0 {
-                                                    ui.label(
-                                                        egui::RichText::new(format!("↩{n}"))
-                                                            .small()
-                                                            .color(Color32::from_rgb(
-                                                                120, 200, 160,
-                                                            )),
-                                                    );
-                                                }
-                                            }
-                                            ui.label(
-                                                egui::RichText::new(text)
-                                                    .monospace()
-                                                    .color(Color32::from_rgb(120, 160, 220)),
-                                            );
-                                        });
-                                    });
+                                // One source of truth for the header controls,
+                                // shared with split_panes (see the method docs).
+                                self.hunk_header_controls(
+                                    ui,
+                                    *hunk_idx,
+                                    text,
+                                    *whole_file,
+                                    focused,
+                                    active_file,
+                                    active_path.as_deref(),
+                                    &replies,
+                                    &mut pending,
+                                    &mut open_comment,
+                                );
                             }
                             RenderRow::DiffLine { kind, old_lineno, new_lineno, .. } => {
                                 let (bg, marker) = match kind {
@@ -2366,6 +2281,7 @@ impl App {
     /// right pane so both panes advance by the same number of rows.
     /// Returns the panes' shared (vertical_offset, viewport_height) so the
     /// caller can record them for PageUp/PageDown.
+    #[allow(clippy::too_many_arguments)]
     fn split_panes(
         &self,
         ui: &mut egui::Ui,
@@ -2374,7 +2290,15 @@ impl App {
         pending_v: Option<f32>,
         sel: Option<&str>,
         clicked_symbol: &mut Option<String>,
+        active_file: Option<usize>,
+        active_path: Option<&str>,
+        replies: &Replies,
+        pending: &mut Vec<(usize, ReviewStatus)>,
+        open_comment: &mut Option<usize>,
     ) -> (f32, f32) {
+        // Cache row of the focused hunk's header, so the strip can draw its
+        // focus marker (matches the unified path's `focus_row`).
+        let focus_row = self.hunk_rows.get(self.focus_hunk).copied();
         let gap = 8.0;
         let pane_w = split_pane_width(ui.available_width(), gap);
         // Shared vertical offset carried across frames in egui memory (the
@@ -2417,23 +2341,24 @@ impl App {
                                         *clicked_symbol = Some(s);
                                     }
                                 }
-                                RenderRow::HunkHeader { text, .. } => {
-                                    // The header strip itself (controls live in
-                                    // the unified path; here in Split we just
-                                    // show its label so the row exists/aligns).
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgb(30, 36, 48))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(if text.is_empty() {
-                                                    " "
-                                                } else {
-                                                    text
-                                                })
-                                                .monospace()
-                                                .color(Color32::from_rgb(120, 160, 220)),
-                                            );
-                                        });
+                                RenderRow::HunkHeader { hunk_idx, text, whole_file } => {
+                                    // Full-width control strip — the SAME one the
+                                    // unified path draws (shared helper, one
+                                    // source of truth). The right pane mirrors a
+                                    // blank spacer for this row so alignment holds.
+                                    let focused = Some(i) == focus_row;
+                                    self.hunk_header_controls(
+                                        ui,
+                                        *hunk_idx,
+                                        text,
+                                        *whole_file,
+                                        focused,
+                                        active_file,
+                                        active_path,
+                                        replies,
+                                        pending,
+                                        open_comment,
+                                    );
                                 }
                                 _ => {
                                     ui.label(" ");
@@ -2497,6 +2422,111 @@ impl App {
         ui.ctx()
             .memory_mut(|m| m.data.insert_temp(scroll_id, new_off));
         (new_off, viewport_h)
+    }
+
+    /// Render the per-hunk control strip: focus marker, status glyph (✓/✗/○),
+    /// approve / reject / clear / comment (💬) buttons, and the `@@` label.
+    ///
+    /// This is the ONE source of truth for the header controls, called by BOTH
+    /// the unified scroll path and `split_panes`' left pane — so the two can't
+    /// drift apart (the Full+Split "controls don't render" regression). It only
+    /// borrows `self` immutably; clicks are collected into `pending` /
+    /// `open_comment`, which the caller applies after the render closure.
+    ///
+    /// `targets` (which review hunks the buttons mutate) follows the same logic
+    /// as the cache: exactly `hunk_idx`, or ALL of the file's hunks when
+    /// `whole_file` (the retained file-level aggregate strip).
+    #[allow(clippy::too_many_arguments)]
+    fn hunk_header_controls(
+        &self,
+        ui: &mut egui::Ui,
+        hunk_idx: usize,
+        text: &str,
+        whole_file: bool,
+        focused: bool,
+        active_file: Option<usize>,
+        active_path: Option<&str>,
+        replies: &Replies,
+        pending: &mut Vec<(usize, ReviewStatus)>,
+        open_comment: &mut Option<usize>,
+    ) {
+        let targets: Vec<usize> = match active_file {
+            Some(f) if whole_file => (0..self.files[f].hunks.len()).collect(),
+            Some(_) => vec![hunk_idx],
+            None => Vec::new(),
+        };
+        let status = active_file
+            .map(|f| aggregate_status(&self.files[f], &targets))
+            .unwrap_or(ReviewStatus::Unreviewed);
+        let hdr_bg = if focused {
+            Color32::from_rgb(48, 58, 80) // focused: brighter
+        } else {
+            Color32::from_rgb(30, 36, 48)
+        };
+        egui::Frame::none().fill(hdr_bg).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Always reserve the focus-marker column so toggling focus
+                // doesn't reflow the row (bug 3 layout shift).
+                ui.label(
+                    egui::RichText::new(if focused { "▶" } else { " " })
+                        .monospace()
+                        .color(Color32::from_rgb(140, 180, 240)),
+                );
+                let (glyph, col) = match status {
+                    ReviewStatus::Approved => ("✓", Color32::from_rgb(120, 200, 120)),
+                    ReviewStatus::Rejected => ("✗", Color32::from_rgb(220, 120, 120)),
+                    ReviewStatus::Unreviewed => ("○", Color32::DARK_GRAY),
+                };
+                ui.label(egui::RichText::new(glyph).color(col));
+                if ui.small_button("approve").clicked() {
+                    for &t in &targets {
+                        pending.push((t, ReviewStatus::Approved));
+                    }
+                }
+                if ui.small_button("reject").clicked() {
+                    for &t in &targets {
+                        pending.push((t, ReviewStatus::Rejected));
+                    }
+                }
+                // Always render "clear" (disabled when nothing to clear) so the
+                // row never reflows when status toggles (bug 3 layout shift).
+                if ui
+                    .add_enabled(
+                        status != ReviewStatus::Unreviewed,
+                        egui::Button::new("clear").small(),
+                    )
+                    .clicked()
+                {
+                    for &t in &targets {
+                        pending.push((t, ReviewStatus::Unreviewed));
+                    }
+                }
+                let has_comment = active_file
+                    .and_then(|f| self.files[f].hunks.get(hunk_idx))
+                    .map(|h| !h.comment.trim().is_empty())
+                    .unwrap_or(false);
+                let cbtn = if has_comment { "💬*" } else { "💬" };
+                if ui.small_button(cbtn).clicked() {
+                    *open_comment = Some(hunk_idx);
+                }
+                // Agent-reply count for this hunk.
+                if let Some(p) = active_path {
+                    let n = replies.for_hunk(p, text).len();
+                    if n > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("↩{n}"))
+                                .small()
+                                .color(Color32::from_rgb(120, 200, 160)),
+                        );
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(text)
+                        .monospace()
+                        .color(Color32::from_rgb(120, 160, 220)),
+                );
+            });
+        });
     }
 }
 
@@ -3448,6 +3478,66 @@ mod ui_tests {
         // panes share `app.cache.len()` rows.
         let ctx = egui::Context::default();
         frame(&ctx, &mut app);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// REGRESSION GUARD (Full+Split controls don't render): the older sequence
+    /// tests assert the HunkHeader ROW exists in the cache, which passed even
+    /// while Split drew only a `@@` label and NO buttons. This renders a REAL
+    /// Full+Split frame and proves the approve/reject control strip is actually
+    /// drawn AND functional: it finds the "approve"/"reject" button widgets by
+    /// label in the rendered output, then CLICKS approve and asserts the hunk's
+    /// status flips to Approved — which can only happen if a real, hittable
+    /// button was painted in the Split header strip (not just a label).
+    #[test]
+    fn full_split_hunk_controls_render_and_are_clickable() {
+        use egui_kittest::kittest::Queryable; // get_by_label / get_all_by_label
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        // The user's PRIMARY mode. Set before the harness takes ownership so the
+        // first frame builds the Split cache in Full extent.
+        app.layout = Layout::Split;
+        app.extent = Extent::Full;
+        app.selected = Some(Selection::Changed(0));
+
+        let mut harness = egui_kittest::Harness::new_state(
+            |ctx, app: &mut App| app.ui(ctx),
+            app,
+        );
+        harness.run();
+
+        // Sanity: we really are in Full+Split with a single hunk (so "approve"
+        // is unambiguous) and the cache is the Split header+line sequence.
+        assert!(harness.state().layout == Layout::Split);
+        assert!(harness.state().extent == Extent::Full);
+
+        // The control strip's buttons must be PRESENT in the rendered frame —
+        // not just the `@@` label. (get_by_label would panic if absent.)
+        let _ = harness.get_all_by_label("approve");
+        let _ = harness.get_all_by_label("reject");
+
+        // FUNCTIONAL proof: click approve. A label-only header has no clickable
+        // widget here, so the status could never flip.
+        harness.get_by_label("approve").click();
+        harness.run();
+
+        let approved = harness
+            .state()
+            .files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .any(|h| h.status == ReviewStatus::Approved);
+        assert!(
+            approved,
+            "clicking approve in a Full+Split hunk header must flip status — \
+             proving a real button was drawn and hit, not just a label"
+        );
+
+        let state = ReviewState::load(&repo).expect("review-state.json written");
+        assert!(
+            state.files.iter().flat_map(|f| &f.hunks).any(|h| h.status == "approved"),
+            "the Split-header click should have persisted approved status to disk"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
