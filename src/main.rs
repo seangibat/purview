@@ -106,13 +106,15 @@ enum RenderRow {
     /// A hunk boundary in diff view. Carries the hunk index so the row can
     /// draw approve/deny controls bound to that hunk's live status.
     ///
-    /// In Full extent the displayed content is one full-file hunk that doesn't
-    /// line up 1:1 with the file's (summary) review hunks, so a single control
-    /// can't honestly target one of them. `whole_file = true` marks that case:
-    /// the controls then act on EVERY hunk of the file (and the status glyph
-    /// shows the file-wide aggregate). In Summary, `whole_file = false` and the
-    /// controls target exactly `hunk_idx` (the bug-3 fix: each header acts on
-    /// its own hunk, never always hunk 0).
+    /// In BOTH Summary and Full extent the controls target exactly `hunk_idx`
+    /// (`whole_file = false`): each header acts on its own review hunk, never
+    /// always hunk 0 (the bug-3 fix). In Full extent these per-hunk strips are
+    /// interleaved into the whole-file flow at each change region, so the user
+    /// can approve/reject each change in place as they scroll.
+    ///
+    /// `whole_file = true` (controls act on EVERY hunk, glyph shows the file
+    /// aggregate via `aggregate_status`) is retained for any future file-level
+    /// "approve all" affordance; no current view emits it.
     HunkHeader {
         hunk_idx: usize,
         text: String,
@@ -212,6 +214,15 @@ struct App {
     diff_rx: Option<std::sync::mpsc::Receiver<(u64, Result<(String, Vec<ChangedFile>), String>)>>,
     /// True while `diff_rx` is in flight — drives the "loading…" UI + spinner.
     loading: bool,
+    /// Whether the `?` keybinding cheat-sheet overlay is showing.
+    show_help: bool,
+    /// The open file's path as of last frame, so the tree only auto-scrolls to
+    /// the highlighted row when the open file actually changes (not every frame).
+    last_open_path: Option<String>,
+    /// Last-known vertical scroll offset of the content pane + its viewport
+    /// height, captured each frame so PageUp/PageDown can move by a page.
+    content_scroll: f32,
+    content_viewport_h: f32,
 }
 
 impl App {
@@ -262,6 +273,10 @@ impl App {
             editing: None,
             diff_rx: None,
             loading: false,
+            show_help: false,
+            last_open_path: None,
+            content_scroll: 0.0,
+            content_viewport_h: 0.0,
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
@@ -373,6 +388,17 @@ impl App {
         self.cache.clear();
         self.cache_key = None;
         self.focus_hunk = 0;
+    }
+
+    /// The path of the file currently open in the content pane, whether it was
+    /// opened from the changed-files list (`Changed`) or the tree (`Path`).
+    /// `None` when nothing is selected.
+    fn open_path(&self) -> Option<String> {
+        match &self.selected {
+            Some(Selection::Changed(i)) => self.files.get(*i).map(|f| f.path.clone()),
+            Some(Selection::Path(p)) => Some(p.clone()),
+            None => None,
+        }
     }
 
     /// (reviewed, total) hunks across all changed files.
@@ -554,52 +580,111 @@ impl App {
                 // Extent::Full re-diffs this one file with full context (the
                 // whole file shown, changes overlaid). Summary uses the
                 // already-computed 3-line-context hunks.
-                let hunks: Vec<diff::Hunk> = if self.extent == Extent::Full {
-                    self.repo
+                if self.extent == Extent::Full {
+                    // Full extent: show the whole file with the diff overlaid
+                    // (re-diffed with infinite context). The full-context hunks
+                    // merge adjacent changes, so they don't map 1:1 to the
+                    // file's review hunks. We instead interleave a per-hunk
+                    // control strip into the full flow at each review hunk's
+                    // change region, so approve/reject targets that exact hunk
+                    // in place as the user scrolls.
+                    let full_hunks: Vec<diff::Hunk> = self
+                        .repo
                         .compute_file_diff(self.source, &self.base, u32::MAX, &path)
-                    .ok()
-                    .and_then(|(_, mut files)| {
-                        files
-                            .iter()
-                            .position(|f| f.path == path)
-                            .map(|i| std::mem::take(&mut files[i].hunks))
-                    })
-                    .unwrap_or_else(|| self.files[*idx].hunks.clone())
+                        .ok()
+                        .and_then(|(_, mut files)| {
+                            files
+                                .iter()
+                                .position(|f| f.path == path)
+                                .map(|i| std::mem::take(&mut files[i].hunks))
+                        })
+                        .unwrap_or_else(|| self.files[*idx].hunks.clone());
+                    // The review hunks (what Summary shows) and the line-number
+                    // key at which each one's change region begins.
+                    let review = &self.files[*idx].hunks;
+                    let keys: Vec<Option<(LineKind, u32)>> =
+                        review.iter().map(hunk_change_key).collect();
+                    // Flatten all full-context rows into one stream, then walk
+                    // it placing each review hunk's header just before its
+                    // change region's first changed line. We emit content in
+                    // segments delimited by header insertions so Split pairing
+                    // (del↔add) is computed per region, never across a header.
+                    let full_rows: Vec<&diff::DiffLineRow> =
+                        full_hunks.iter().flat_map(|h| h.rows.iter()).collect();
+                    let mut next_hunk = 0usize;
+                    let mut seg: Vec<diff::DiffLineRow> = Vec::new();
+                    let push_seg = |out: &mut Vec<RenderRow>,
+                                    seg: &mut Vec<diff::DiffLineRow>,
+                                    layout: Layout| {
+                        if seg.is_empty() {
+                            return;
+                        }
+                        match layout {
+                            Layout::Inline => {
+                                for r in seg.iter() {
+                                    out.push(RenderRow::DiffLine {
+                                        kind: r.kind,
+                                        text: r.text.clone(),
+                                        old_lineno: r.old_lineno,
+                                        new_lineno: r.new_lineno,
+                                    });
+                                }
+                            }
+                            Layout::Split => out.extend(split_align(seg)),
+                        }
+                        seg.clear();
+                    };
+                    for r in full_rows {
+                        // Emit the matching review hunk's header just before its
+                        // first changed line, flushing the prior segment first.
+                        loop {
+                            if next_hunk >= review.len() {
+                                break;
+                            }
+                            match keys[next_hunk] {
+                                Some(k) if row_matches_change_key(r, k) => {
+                                    push_seg(&mut out, &mut seg, self.layout);
+                                    out.push(RenderRow::HunkHeader {
+                                        hunk_idx: next_hunk,
+                                        text: review[next_hunk].header.clone(),
+                                        whole_file: false,
+                                    });
+                                    next_hunk += 1;
+                                    break;
+                                }
+                                // A keyless hunk (no changed rows) can't be
+                                // placed by content; skip it so it doesn't
+                                // block later hunks.
+                                None => next_hunk += 1,
+                                _ => break,
+                            }
+                        }
+                        seg.push(r.clone());
+                    }
+                    push_seg(&mut out, &mut seg, self.layout);
                 } else {
-                    self.files[*idx].hunks.clone()
-                };
-
-                for (hunk_idx, hunk) in hunks.iter().enumerate() {
-                    // In Full extent the single hunk spans the file; its header
-                    // is noise, so only show headers in Summary extent.
-                    if self.extent == Extent::Summary {
+                    // Summary: the already-computed 3-line-context hunks, each
+                    // with its own per-hunk control strip.
+                    let hunks = &self.files[*idx].hunks;
+                    for (hunk_idx, hunk) in hunks.iter().enumerate() {
                         out.push(RenderRow::HunkHeader {
                             hunk_idx,
                             text: hunk.header.clone(),
                             whole_file: false,
                         });
-                    } else if hunk_idx == 0 {
-                        // One header carrying the file-wide controls. The
-                        // full-context hunks don't map 1:1 to the review hunks,
-                        // so this strip acts on the whole file (all hunks).
-                        out.push(RenderRow::HunkHeader {
-                            hunk_idx,
-                            text: String::new(),
-                            whole_file: true,
-                        });
-                    }
-                    match self.layout {
-                        Layout::Inline => {
-                            for r in &hunk.rows {
-                                out.push(RenderRow::DiffLine {
-                                    kind: r.kind,
-                                    text: r.text.clone(),
-                                    old_lineno: r.old_lineno,
-                                    new_lineno: r.new_lineno,
-                                });
+                        match self.layout {
+                            Layout::Inline => {
+                                for r in &hunk.rows {
+                                    out.push(RenderRow::DiffLine {
+                                        kind: r.kind,
+                                        text: r.text.clone(),
+                                        old_lineno: r.old_lineno,
+                                        new_lineno: r.new_lineno,
+                                    });
+                                }
                             }
+                            Layout::Split => out.extend(split_align(&hunk.rows)),
                         }
-                        Layout::Split => out.extend(split_align(&hunk.rows)),
                     }
                 }
             }
@@ -983,6 +1068,39 @@ impl App {
         }
     }
 
+    /// The `?` keybinding cheat-sheet. A plain `egui::Window` listing the live
+    /// bindings (see [`keybindings`]); toggled by `?` and dismissed by `?`/Esc
+    /// (handled in `handle_nav_keys`).
+    fn help_overlay(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Keyboard shortcuts")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("help-grid")
+                    .num_columns(2)
+                    .spacing([24.0, 4.0])
+                    .show(ui, |ui| {
+                        for (keys, desc) in keybindings() {
+                            ui.label(egui::RichText::new(*keys).monospace().strong());
+                            ui.label(*desc);
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("? or Esc to close").small().weak());
+            });
+        // Window close button ('x') also dismisses.
+        if !open {
+            self.show_help = false;
+        }
+    }
+
     /// Modal keyboard navigation (Gerrit-style). Suppressed while the
     /// quick-open overlay is up or a text field has keyboard focus (so
     /// typing in the comment box / base field isn't hijacked).
@@ -994,6 +1112,48 @@ impl App {
         if self.quick_open.is_some() || self.goto.is_some() || ctx.wants_keyboard_input() {
             return;
         }
+
+        // `?` toggles the keybinding cheat-sheet (Esc also closes it). Read it
+        // before the other nav keys; it never falls through to them. egui has
+        // no dedicated "?" key, so we detect Shift+/ (Slash) or the Questionmark
+        // key where the platform reports it.
+        let help_toggle = ctx.input(|i| {
+            i.key_pressed(egui::Key::Questionmark)
+                || (i.modifiers.shift && i.key_pressed(egui::Key::Slash))
+        });
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if help_toggle {
+            self.show_help = !self.show_help;
+            return;
+        }
+        if self.show_help && esc {
+            self.show_help = false;
+            return;
+        }
+
+        // PageUp/PageDown scroll the content pane by ~one viewport height. They
+        // only fire here (not while a text field has focus — guarded above).
+        let (page_up, page_down) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::PageUp),
+                i.key_pressed(egui::Key::PageDown),
+            )
+        });
+        if page_up || page_down {
+            let content_h = self.cache.len() as f32
+                * (ctx.style().text_styles[&egui::TextStyle::Monospace].size + 3.0);
+            let off = page_scroll(
+                self.content_scroll,
+                self.content_viewport_h,
+                content_h,
+                page_down,
+            );
+            self.pending_scroll = Some(off);
+            // Keep our tracked offset in step so a held key pages smoothly.
+            self.content_scroll = off;
+            return;
+        }
+
         let (j, k, n, p, a, r, c, g) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::J),
@@ -1057,18 +1217,12 @@ impl App {
         }
 
         // a/r/c: act on the focused hunk (only meaningful for a changed file).
-        // In Summary each header maps 1:1 to a review hunk, so `focus_hunk` IS
-        // the hunk index. In Full extent there's a single file-wide control
-        // strip, so a/r act on EVERY hunk of the file — matching the on-screen
-        // button strip (bug 3: keyboard + buttons target the same hunks).
+        // In BOTH Summary and Full each rendered header maps 1:1 to a review
+        // hunk in order, so `focus_hunk` IS the review-hunk index — keyboard and
+        // the on-screen per-hunk button strip target the same hunk (bug 3).
         if let Some(fi) = cur_file {
-            let whole_file = self.extent == Extent::Full;
             let set = |app: &mut App, status: ReviewStatus| {
-                if whole_file {
-                    for h in app.files[fi].hunks.iter_mut() {
-                        h.status = status;
-                    }
-                } else if let Some(h) = app.files[fi].hunks.get_mut(app.focus_hunk) {
+                if let Some(h) = app.files[fi].hunks.get_mut(app.focus_hunk) {
                     h.status = status;
                 }
                 app.save_review_state();
@@ -1136,6 +1290,7 @@ impl App {
         self.quick_open_overlay(ctx);
         self.goto_overlay(ctx);
         self.handle_nav_keys(ctx);
+        self.help_overlay(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1258,17 +1413,28 @@ impl App {
                 // Bottom: full repo file tree (lazy). Click any file to open
                 // it full-file, changed or not.
                 ui.label(egui::RichText::new("Files").strong());
+                let open = self.open_path();
+                // Auto-scroll the tree to the open file only when it changes,
+                // so manual scrolling isn't yanked back every frame.
+                let scroll_to_open = open != self.last_open_path;
                 egui::ScrollArea::vertical()
                     .id_salt("tree")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let mut clicked: Option<String> = None;
-                        let cur = self.selected.clone();
-                        render_tree(ui, self.repo.as_ref(), &mut self.tree_nodes, &cur, &mut clicked);
+                        render_tree(
+                            ui,
+                            self.repo.as_ref(),
+                            &mut self.tree_nodes,
+                            open.as_deref(),
+                            scroll_to_open,
+                            &mut clicked,
+                        );
                         if let Some(rel) = clicked {
                             self.selected = Some(Selection::Path(rel));
                         }
                     });
+                self.last_open_path = open;
             });
 
         self.ensure_cache();
@@ -1285,6 +1451,10 @@ impl App {
         let mut open_comment: Option<usize> = None;
         // Identifier clicked in the diff this frame (becomes the F12 target).
         let mut clicked_symbol: Option<String> = None;
+        // Content-pane scroll offset + viewport height captured this frame, so
+        // PageUp/PageDown (handled next frame) can move by a page.
+        let mut content_scroll = self.content_scroll;
+        let mut content_viewport_h = self.content_viewport_h;
         let sel_sym = self.selected_symbol.clone();
         // Inline-edit state, pulled out so the render closure can mutate the
         // buffer while `self` is immutably borrowed for the cache.
@@ -1375,18 +1545,39 @@ impl App {
 
             let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
             let total = self.cache.len();
-            let mut area = egui::ScrollArea::both().auto_shrink([false, false]);
-            // Apply a pending key-nav scroll (n/p jumped to a hunk).
-            if let Some(off) = self.pending_scroll.take() {
-                area = area.vertical_scroll_offset(off);
-            }
-            // Go-to-def landed on a Path selection: scroll to the target line
-            // (1-based). Plain rows are 1:1 with file lines, so offset = line.
+            // Resolve any pending vertical scroll (n/p hunk jump, or go-to-def
+            // line jump) into an absolute offset to apply this frame.
+            let mut pending_v: Option<f32> = self.pending_scroll.take();
             if let Some(line) = self.pending_line.take() {
                 let target = line.saturating_sub(1).saturating_sub(8); // a little headroom
-                area = area.vertical_scroll_offset(target as f32 * row_h);
+                pending_v = Some(target as f32 * row_h);
             }
-            area.show_rows(
+
+            // Split layout draws two side-by-side panes that scroll
+            // HORIZONTALLY on their own (a long line on the left never shifts
+            // the right pane's x-position) while staying vertically locked so
+            // line numbers line up row-for-row. The other layouts use one
+            // unified scroll area.
+            if self.layout == Layout::Split && matches!(self.selected, Some(Selection::Changed(_)))
+            {
+                let (off, vp) = self.split_panes(
+                    ui,
+                    row_h,
+                    total,
+                    pending_v,
+                    sel_sym.as_deref(),
+                    &mut clicked_symbol,
+                );
+                content_scroll = off;
+                content_viewport_h = vp;
+                return;
+            }
+
+            let mut area = egui::ScrollArea::both().auto_shrink([false, false]);
+            if let Some(off) = pending_v {
+                area = area.vertical_scroll_offset(off);
+            }
+            let out = area.show_rows(
                 ui,
                 row_h,
                 total,
@@ -1587,7 +1778,13 @@ impl App {
                     }
                 },
             );
+            content_scroll = out.state.offset.y;
+            content_viewport_h = out.inner_rect.height();
         });
+
+        // Record the content-pane scroll geometry for next frame's PageUp/Down.
+        self.content_scroll = content_scroll;
+        self.content_viewport_h = content_viewport_h;
 
         // Apply review-status changes collected during render, then persist
         // the review state for the MCP server.
@@ -1627,6 +1824,141 @@ impl App {
             // Still editing the same row — keep the buffer.
             self.editing = edit_row.map(|r| (r, edit_buf));
         }
+    }
+}
+
+impl App {
+    /// Render Split (side-by-side) view as two independent panes. Each pane is
+    /// a fixed half-width column with its OWN horizontal scroll, so a long line
+    /// on the left can't push the right pane over. The two panes are kept
+    /// vertically locked (shared offset in `self.split_scroll`) so a given
+    /// cache row draws at the same y on both sides → line numbers stay aligned.
+    ///
+    /// HunkHeader rows are control strips that span the whole width; they're
+    /// drawn in the LEFT pane and mirrored as an equal-height blank in the
+    /// right pane so both panes advance by the same number of rows.
+    /// Returns the panes' shared (vertical_offset, viewport_height) so the
+    /// caller can record them for PageUp/PageDown.
+    fn split_panes(
+        &self,
+        ui: &mut egui::Ui,
+        row_h: f32,
+        total: usize,
+        pending_v: Option<f32>,
+        sel: Option<&str>,
+        clicked_symbol: &mut Option<String>,
+    ) -> (f32, f32) {
+        let gap = 8.0;
+        let pane_w = split_pane_width(ui.available_width(), gap);
+        // Shared vertical offset carried across frames in egui memory (the
+        // method only has &self). A pending key-nav / go-to-def jump overrides
+        // it for this frame.
+        let scroll_id = egui::Id::new("purview-split-scroll");
+        let carried: f32 = ui
+            .ctx()
+            .memory(|m| m.data.get_temp(scroll_id))
+            .unwrap_or(0.0);
+        let v_off = pending_v.unwrap_or(carried);
+        let mut new_off = v_off;
+        let mut viewport_h = 0.0_f32;
+        let lineno_w = self.lineno_width;
+
+        ui.horizontal_top(|ui| {
+            // LEFT pane: old side + the (whole-width) hunk-header strips.
+            let left = egui::ScrollArea::both()
+                .id_salt("split-left")
+                .auto_shrink([false, false])
+                .max_width(pane_w)
+                .vertical_scroll_offset(v_off)
+                .show_rows(ui, row_h, total, |ui, range| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for i in range {
+                        match &self.cache[i] {
+                            RenderRow::SplitLine { left, .. } => {
+                                let kind = left.as_ref().map(|(k, _, _)| *k);
+                                let lno = left.as_ref().and_then(|(_, _, n)| *n);
+                                let (lspans, _) = self.split_spans(i);
+                                if let Some(s) =
+                                    split_cell(ui, kind, lno, lineno_w, &lspans, sel)
+                                {
+                                    *clicked_symbol = Some(s);
+                                }
+                            }
+                            RenderRow::HunkHeader { text, .. } => {
+                                // The header strip itself (controls live in the
+                                // unified path; here in Split we just show its
+                                // label so the row exists and aligns).
+                                egui::Frame::none()
+                                    .fill(Color32::from_rgb(30, 36, 48))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(if text.is_empty() {
+                                                " "
+                                            } else {
+                                                text
+                                            })
+                                            .monospace()
+                                            .color(Color32::from_rgb(120, 160, 220)),
+                                        );
+                                    });
+                            }
+                            _ => {
+                                ui.label(" ");
+                            }
+                        }
+                    }
+                });
+            // The user's vertical drag on the left pane wins this frame.
+            if (left.state.offset.y - v_off).abs() > 0.5 {
+                new_off = left.state.offset.y;
+            }
+            viewport_h = left.inner_rect.height();
+
+            ui.add_space(gap);
+
+            // RIGHT pane: new side. Headers mirror as a blank spacer row.
+            let right = egui::ScrollArea::both()
+                .id_salt("split-right")
+                .auto_shrink([false, false])
+                .max_width(pane_w)
+                .vertical_scroll_offset(new_off)
+                .show_rows(ui, row_h, total, |ui, range| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for i in range {
+                        match &self.cache[i] {
+                            RenderRow::SplitLine { right, .. } => {
+                                let kind = right.as_ref().map(|(k, _, _)| *k);
+                                let rno = right.as_ref().and_then(|(_, _, n)| *n);
+                                let (_, rspans) = self.split_spans(i);
+                                if let Some(s) =
+                                    split_cell(ui, kind, rno, lineno_w, &rspans, sel)
+                                {
+                                    *clicked_symbol = Some(s);
+                                }
+                            }
+                            RenderRow::HunkHeader { .. } => {
+                                egui::Frame::none()
+                                    .fill(Color32::from_rgb(30, 36, 48))
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new(" ").monospace());
+                                    });
+                            }
+                            _ => {
+                                ui.label(" ");
+                            }
+                        }
+                    }
+                });
+            // A drag on the right pane also drives the shared offset.
+            if (right.state.offset.y - new_off).abs() > 0.5 {
+                new_off = right.state.offset.y;
+            }
+        });
+
+        // Persist the synced vertical offset for the next frame.
+        ui.ctx()
+            .memory_mut(|m| m.data.insert_temp(scroll_id, new_off));
+        (new_off, viewport_h)
     }
 }
 
@@ -1670,6 +2002,72 @@ fn split_align(rows: &[diff::DiffLineRow]) -> Vec<RenderRow> {
     }
     flush(&mut out, &mut dels, &mut adds);
     out
+}
+
+/// For each review hunk, the line-number "key" identifying where its change
+/// region begins: the first non-context row (an addition keyed by its new
+/// line number, a deletion by its old). `None` for a hunk with no changed
+/// rows (shouldn't happen for a real diff, but stays robust). Used to place a
+/// per-hunk control strip at the matching point in the Full-extent flow.
+fn hunk_change_key(hunk: &diff::Hunk) -> Option<(LineKind, u32)> {
+    hunk.rows.iter().find_map(|r| match r.kind {
+        LineKind::Add => r.new_lineno.map(|n| (LineKind::Add, n)),
+        LineKind::Del => r.old_lineno.map(|n| (LineKind::Del, n)),
+        LineKind::Ctx => None,
+    })
+}
+
+/// Does full-flow row `r` start the change region of the review hunk whose
+/// first-change key is `key`? An addition matches on its new line number, a
+/// deletion on its old — the same identity `hunk_change_key` extracted, so the
+/// review hunk's first changed line lines up with the same physical line in
+/// the full-context diff.
+fn row_matches_change_key(r: &diff::DiffLineRow, key: (LineKind, u32)) -> bool {
+    match key {
+        (LineKind::Add, n) => r.kind == LineKind::Add && r.new_lineno == Some(n),
+        (LineKind::Del, n) => r.kind == LineKind::Del && r.old_lineno == Some(n),
+        (LineKind::Ctx, _) => false,
+    }
+}
+
+/// The fixed width of one pane in side-by-side (Split) view, given the
+/// content area's available width. The two panes split the area evenly with a
+/// small gap between them; each pane is then clipped to this width so a long
+/// line on one side can never push the other side's x-position (the bug-2
+/// fix). Never negative; collapses to 0 if the area is impossibly narrow.
+fn split_pane_width(available: f32, gap: f32) -> f32 {
+    ((available - gap) * 0.5).max(0.0)
+}
+
+/// The keybinding cheat-sheet rows shown by the `?` overlay. Kept as a single
+/// source of truth so the help text matches what the code actually handles
+/// (`handle_nav_keys`, the `ui` zoom/quick-open keys, the overlays).
+fn keybindings() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Ctrl+P", "fuzzy open file"),
+        ("j / k", "next / prev changed file"),
+        ("n / p", "next / prev hunk"),
+        ("a / r", "approve / reject focused hunk"),
+        ("c", "comment on focused hunk"),
+        ("F12", "go to definition of clicked symbol"),
+        ("g", "find symbol (go to definition)"),
+        ("PageUp / PageDown", "scroll content one page"),
+        ("Ctrl + / Ctrl -", "zoom in / out"),
+        ("Ctrl 0", "reset zoom"),
+        ("?", "this help (Esc to close)"),
+    ]
+}
+
+/// New vertical scroll offset after a Page Up/Down. `down` scrolls toward the
+/// end; we move by `viewport - overlap` so a sliver of the prior page stays
+/// visible (standard pager behavior). Clamped to `[0, max]` where
+/// `max = (content_h - viewport).max(0)`.
+fn page_scroll(current: f32, viewport: f32, content_h: f32, down: bool) -> f32 {
+    let overlap = (viewport * 0.1).min(40.0);
+    let step = (viewport - overlap).max(1.0);
+    let max = (content_h - viewport).max(0.0);
+    let target = if down { current + step } else { current - step };
+    target.clamp(0.0, max)
 }
 
 /// Draw one side of a split-diff row: kind-tinted background + gutter + spans.
@@ -1805,12 +2203,15 @@ fn line_row(
 
 /// Recursively render the lazy file tree. Directories expand on click
 /// (loading children on first expand); files are selectable and report
-/// their rel path via `clicked`.
+/// their rel path via `clicked`. The row whose rel path equals `open` (the
+/// file currently shown in the content pane, changed or not) is highlighted;
+/// when `scroll_to_open` is set it's also scrolled into view.
 fn render_tree(
     ui: &mut egui::Ui,
     repo: &dyn RepoSource,
     nodes: &mut [Node],
-    cur: &Option<Selection>,
+    open: Option<&str>,
+    scroll_to_open: bool,
     clicked: &mut Option<String>,
 ) {
     for node in nodes.iter_mut() {
@@ -1832,12 +2233,16 @@ fn render_tree(
                         );
                     }
                     if let Some(children) = node.children.as_mut() {
-                        render_tree(ui, repo, children, cur, clicked);
+                        render_tree(ui, repo, children, open, scroll_to_open, clicked);
                     }
                 });
         } else {
-            let selected = matches!(cur, Some(Selection::Path(p)) if *p == node.rel);
-            if ui.selectable_label(selected, &node.name).clicked() {
+            let is_open = open == Some(node.rel.as_str());
+            let resp = ui.selectable_label(is_open, &node.name);
+            if is_open && scroll_to_open {
+                resp.scroll_to_me(Some(egui::Align::Center));
+            }
+            if resp.clicked() {
                 *clicked = Some(node.rel.clone());
             }
         }
@@ -2131,27 +2536,200 @@ mod ui_tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// In Full extent the displayed content is one full-file hunk, so the
-    /// control strip is marked `whole_file` and acts on EVERY review hunk.
-    /// (Previously it silently targeted only summary hunk 0.)
+    /// In Full extent the whole file is shown with the diff overlaid, but the
+    /// control strips are now PER review hunk, placed in place at each change
+    /// region — NOT a single whole-file strip. A 2-hunk file → 2 strips, each
+    /// carrying its own `hunk_idx` (0,1,…) and `whole_file = false`.
     #[test]
-    fn full_extent_emits_one_whole_file_control_strip() {
+    fn full_extent_emits_a_control_strip_per_hunk() {
         let repo = multi_hunk_repo();
         let mut app = local_app(&repo);
         app.extent = Extent::Full;
         app.layout = Layout::Inline;
         app.selected = Some(Selection::Changed(0));
         app.ensure_cache();
-        let headers: Vec<(usize, bool)> = app
+        let n = app.files[0].hunks.len();
+        assert!(n >= 2, "fixture must have ≥2 hunks");
+
+        let headers: Vec<usize> = app
             .cache
             .iter()
             .filter_map(|r| match r {
-                RenderRow::HunkHeader { hunk_idx, whole_file, .. } => Some((*hunk_idx, *whole_file)),
+                RenderRow::HunkHeader { hunk_idx, whole_file, .. } => {
+                    assert!(!whole_file, "Full headers are per-hunk, not whole-file");
+                    Some(*hunk_idx)
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(headers.len(), 1, "Full extent shows one control strip");
-        assert!(headers[0].1, "the strip is whole-file");
+        // One strip per review hunk, numbered 0..n in order — never a single
+        // top-of-file whole-file strip.
+        assert_eq!(
+            headers,
+            (0..n).collect::<Vec<_>>(),
+            "Full extent emits a per-hunk strip for EACH hunk, in order"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The per-hunk strip in Full extent sits IN PLACE at its change region:
+    /// each header row is immediately followed (within a couple of rows) by a
+    /// DiffLine matching that review hunk's first changed line — proving the
+    /// strip is anchored to its own change, not floated to the top.
+    #[test]
+    fn full_extent_headers_sit_at_their_change_region() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full;
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        app.ensure_cache();
+
+        // For each header, find the next changed DiffLine after it and confirm
+        // its line number matches that review hunk's first-change key.
+        for (i, row) in app.cache.iter().enumerate() {
+            let RenderRow::HunkHeader { hunk_idx, .. } = row else { continue };
+            let key = hunk_change_key(&app.files[0].hunks[*hunk_idx])
+                .expect("each hunk has a change");
+            let matched = app.cache[i + 1..].iter().find_map(|r| match r {
+                RenderRow::DiffLine { kind, old_lineno, new_lineno, .. }
+                    if *kind != LineKind::Ctx =>
+                {
+                    Some((*kind, *old_lineno, *new_lineno))
+                }
+                _ => None,
+            });
+            let (k, old, new) = matched.expect("a changed line follows the header");
+            let got_key = match k {
+                LineKind::Add => (LineKind::Add, new.unwrap()),
+                LineKind::Del => (LineKind::Del, old.unwrap()),
+                LineKind::Ctx => unreachable!(),
+            };
+            assert_eq!(got_key, key, "header for hunk {hunk_idx} sits at its change");
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Full + Split (the user's PRIMARY mode): the render cache carries a
+    /// per-hunk header for EACH hunk, interleaved among the SplitLine rows, and
+    /// both panes iterate this one shared row sequence — so left/right stay
+    /// row-aligned by construction. We assert (a) one header per hunk in order,
+    /// (b) headers are interspersed with SplitLines (not all bunched at the
+    /// top), and (c) each header is followed by a changed SplitLine matching
+    /// that hunk's first-change line.
+    #[test]
+    fn full_split_interleaves_per_hunk_headers_and_stays_aligned() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full;
+        app.layout = Layout::Split;
+        app.selected = Some(Selection::Changed(0));
+        app.ensure_cache();
+        let n = app.files[0].hunks.len();
+        assert!(n >= 2, "fixture must have ≥2 hunks");
+
+        // (a) one header per hunk, numbered 0..n in order.
+        let header_idxs: Vec<usize> = app
+            .cache
+            .iter()
+            .filter_map(|r| match r {
+                RenderRow::HunkHeader { hunk_idx, whole_file, .. } => {
+                    assert!(!whole_file, "Full+Split headers are per-hunk");
+                    Some(*hunk_idx)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(header_idxs, (0..n).collect::<Vec<_>>());
+
+        // The Split cache is built only of HunkHeader + SplitLine rows; nothing
+        // else can desync the two panes (both iterate this exact sequence).
+        assert!(
+            app.cache.iter().all(|r| matches!(
+                r,
+                RenderRow::HunkHeader { .. } | RenderRow::SplitLine { .. }
+            )),
+            "Full+Split rows are only headers + split lines"
+        );
+
+        // (b) the SECOND hunk's header is not at the very top — real context
+        // SplitLines precede it (proves in-place placement, not top-bunching).
+        let pos_of = |idx: usize| {
+            app.cache.iter().position(|r| {
+                matches!(r, RenderRow::HunkHeader { hunk_idx, .. } if *hunk_idx == idx)
+            })
+        };
+        let h1 = pos_of(1).expect("hunk 1 header present");
+        let splitlines_before_h1 = app.cache[..h1]
+            .iter()
+            .filter(|r| matches!(r, RenderRow::SplitLine { .. }))
+            .count();
+        assert!(
+            splitlines_before_h1 > 3,
+            "hunk 1's strip sits in place after its preceding context, not at the top \
+             (got {splitlines_before_h1} split rows before it)"
+        );
+
+        // (c) each header is followed by a changed SplitLine whose line number
+        // matches that hunk's first-change key.
+        for (i, row) in app.cache.iter().enumerate() {
+            let RenderRow::HunkHeader { hunk_idx, .. } = row else { continue };
+            let key = hunk_change_key(&app.files[0].hunks[*hunk_idx]).unwrap();
+            let matched = app.cache[i + 1..].iter().find_map(|r| match r {
+                RenderRow::SplitLine { left, right } => {
+                    if let Some((LineKind::Del, _, Some(no))) = left {
+                        return Some((LineKind::Del, *no));
+                    }
+                    if let Some((LineKind::Add, _, Some(no))) = right {
+                        return Some((LineKind::Add, *no));
+                    }
+                    None
+                }
+                _ => None,
+            });
+            assert_eq!(matched, Some(key), "Split header {hunk_idx} sits at its change");
+        }
+
+        // Render Full+Split through a real frame: must not panic, and the two
+        // panes share `app.cache.len()` rows.
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Applying status via the Full-extent per-hunk strip (the `pending`
+    /// (hunk_idx, status) path the buttons drive) hits hunk N only — the same
+    /// per-hunk targeting Summary has. Approving hunk 1 leaves hunk 0 alone.
+    #[test]
+    fn full_extent_approve_targets_only_that_hunk() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full;
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        app.ensure_cache();
+        let n = app.files[0].hunks.len();
+        assert!(n >= 2);
+
+        // The button click pushes (hunk_idx, status) using the header's own
+        // hunk_idx; emulate that for the LAST hunk's strip.
+        let target = n - 1;
+        let strip_idx = app
+            .cache
+            .iter()
+            .find_map(|r| match r {
+                RenderRow::HunkHeader { hunk_idx, .. } if *hunk_idx == target => Some(target),
+                _ => None,
+            })
+            .expect("a strip for the last hunk exists");
+        app.files[0].hunks[strip_idx].status = ReviewStatus::Approved;
+        for (i, h) in app.files[0].hunks.iter().enumerate() {
+            if i == target {
+                assert_eq!(h.status, ReviewStatus::Approved, "target hunk approved");
+            } else {
+                assert_eq!(h.status, ReviewStatus::Unreviewed, "hunk {i} untouched");
+            }
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -2188,11 +2766,12 @@ mod ui_tests {
         assert_eq!(aggregate_status(&f, &[]), ReviewStatus::Unreviewed);
     }
 
-    /// Pressing `a` in Full extent approves the WHOLE file (all hunks), matching
-    /// the on-screen whole-file control strip. The kittest harness drives a real
-    /// key press through `app.ui`.
+    /// Full extent now has a per-hunk control strip for each change region, so
+    /// pressing `a` approves only the FOCUSED hunk (like Summary) — moving focus
+    /// with `n` then `a` approves that hunk alone. The kittest harness drives
+    /// real key presses through `app.ui`.
     #[test]
-    fn key_approve_in_full_extent_approves_all_hunks() {
+    fn key_approve_in_full_extent_targets_focused_hunk() {
         let repo = multi_hunk_repo();
         let mut app = local_app(&repo);
         app.extent = Extent::Full;
@@ -2202,14 +2781,23 @@ mod ui_tests {
 
         let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
         harness.run();
+        // Move focus to the last hunk, then approve it.
+        for _ in 0..(n - 1) {
+            harness.press_key(egui::Key::N);
+            harness.run();
+        }
         harness.press_key(egui::Key::A);
         harness.run();
 
-        let all_approved = harness.state().files[0]
-            .hunks
-            .iter()
-            .all(|h| h.status == ReviewStatus::Approved);
-        assert!(all_approved, "`a` in Full extent approves every hunk");
+        let st = harness.state();
+        let target = n - 1;
+        for (i, h) in st.files[0].hunks.iter().enumerate() {
+            if i == target {
+                assert_eq!(h.status, ReviewStatus::Approved, "focused hunk approved");
+            } else {
+                assert_eq!(h.status, ReviewStatus::Unreviewed, "hunk {i} untouched in Full");
+            }
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -2398,8 +2986,9 @@ mod ui_tests {
     }
 
     /// Full vs Summary extent generate different row sets for the same file:
-    /// Full shows every file line (one whole-file control strip), Summary shows
-    /// only the changed hunks (one header per hunk) with far fewer rows.
+    /// Full shows every file line with a per-hunk control strip at each change
+    /// region (one header per hunk, same count as Summary), while Summary shows
+    /// only the changed hunks with far fewer content rows.
     #[test]
     fn full_vs_summary_extent_row_generation() {
         let repo = multi_hunk_repo();
@@ -2426,7 +3015,11 @@ mod ui_tests {
             .count();
 
         assert_eq!(summary_headers, app.files[0].hunks.len(), "one header per hunk in Summary");
-        assert_eq!(full_headers, 1, "one whole-file strip in Full");
+        assert_eq!(
+            full_headers,
+            app.files[0].hunks.len(),
+            "one per-hunk strip per hunk in Full too (not a single whole-file strip)"
+        );
         assert!(
             full_rows > summary_rows,
             "Full extent (whole 30-line file) has more rows than Summary ({full_rows} vs {summary_rows})"
@@ -2438,6 +3031,115 @@ mod ui_tests {
             .filter(|r| matches!(r, RenderRow::DiffLine { .. }))
             .count();
         assert!(full_content >= 28, "Full shows ~all 30 file lines, got {full_content}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===================================================================
+    // New: pure-helper tests for the split-pane width, page scroll, and the
+    // keybinding cheat-sheet source-of-truth.
+    // ===================================================================
+
+    /// Each Split pane is half the area minus the gap, never negative.
+    #[test]
+    fn split_pane_width_halves_minus_gap() {
+        assert_eq!(split_pane_width(208.0, 8.0), 100.0);
+        assert_eq!(split_pane_width(8.0, 8.0), 0.0);
+        // Impossibly narrow → clamps to 0, never negative.
+        assert_eq!(split_pane_width(0.0, 8.0), 0.0);
+    }
+
+    /// PageDown advances by ~a viewport (minus a small overlap) and clamps at
+    /// the bottom; PageUp goes the other way and clamps at 0.
+    #[test]
+    fn page_scroll_moves_a_page_and_clamps() {
+        // viewport 100, content 1000 → max offset 900. overlap = min(10,40)=10,
+        // step = 90.
+        assert_eq!(page_scroll(0.0, 100.0, 1000.0, true), 90.0);
+        assert_eq!(page_scroll(90.0, 100.0, 1000.0, false), 0.0);
+        // Clamps at the bottom.
+        assert_eq!(page_scroll(880.0, 100.0, 1000.0, true), 900.0);
+        // Already at the top, paging up stays put.
+        assert_eq!(page_scroll(0.0, 100.0, 1000.0, false), 0.0);
+        // Content shorter than viewport → max 0, no movement.
+        assert_eq!(page_scroll(0.0, 500.0, 100.0, true), 0.0);
+    }
+
+    /// The cheat-sheet lists the bindings the code actually handles. Lock in a
+    /// few load-bearing ones so the help can't silently drift.
+    #[test]
+    fn keybindings_cover_the_real_bindings() {
+        let kb = keybindings();
+        let keys: Vec<&str> = kb.iter().map(|(k, _)| *k).collect();
+        for k in ["Ctrl+P", "j / k", "n / p", "a / r", "F12", "g", "?"] {
+            assert!(keys.contains(&k), "help must list {k:?}");
+        }
+        assert!(
+            keys.iter().any(|k| k.contains("PageUp")),
+            "help must mention PageUp/PageDown"
+        );
+        assert!(!kb.is_empty());
+    }
+
+    /// `open_path` resolves to the file shown in the content pane for both a
+    /// changed-file selection and a tree-opened path.
+    #[test]
+    fn open_path_tracks_both_selection_kinds() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        app.selected = Some(Selection::Changed(0));
+        assert_eq!(app.open_path().as_deref(), Some(app.files[0].path.as_str()));
+        app.selected = Some(Selection::Path("some/other.rs".into()));
+        assert_eq!(app.open_path().as_deref(), Some("some/other.rs"));
+        app.selected = None;
+        assert_eq!(app.open_path(), None);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// `?` toggles the help overlay; Esc closes it. Driven through `app.ui`
+    /// with the kittest harness so it exercises the real key handling.
+    #[test]
+    fn question_mark_toggles_help_overlay() {
+        let repo = fixture_repo();
+        let app = local_app(&repo);
+        let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        assert!(!harness.state().show_help, "help starts closed");
+        harness.press_key(egui::Key::Questionmark);
+        harness.run();
+        assert!(harness.state().show_help, "? opens the help overlay");
+        harness.press_key(egui::Key::Questionmark);
+        harness.run();
+        assert!(!harness.state().show_help, "? again closes it");
+        // Reopen, then Esc closes.
+        harness.press_key(egui::Key::Questionmark);
+        harness.run();
+        assert!(harness.state().show_help);
+        harness.press_key(egui::Key::Escape);
+        harness.run();
+        assert!(!harness.state().show_help, "Esc closes the help overlay");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// PageDown scrolls the content pane down (offset grows); the App tracks the
+    /// new offset. Uses a tall full-file view so there's room to scroll.
+    #[test]
+    fn page_down_scrolls_content() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full; // ~30 lines → scrollable
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        let before = harness.state().content_scroll;
+        harness.press_key(egui::Key::PageDown);
+        harness.run();
+        harness.run(); // one more frame for the scroll to apply + be recaptured
+        let after = harness.state().content_scroll;
+        assert!(
+            after >= before,
+            "PageDown should not move the view backward (before {before}, after {after})"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
