@@ -54,8 +54,10 @@ struct Goto {
     just_opened: bool,
     /// Set while the background resolve thread is running.
     resolving: bool,
-    /// Receives the resolved definition (or None) from the worker thread.
-    rx: Option<std::sync::mpsc::Receiver<Option<purview::gotodef::Candidate>>>,
+    /// Receives the resolved definition from the worker thread: `Ok(Some(_))`
+    /// = found, `Ok(None)` = no candidates / no definition, `Err(_)` = grep or
+    /// resolve failed. The whole grep+resolve pipeline runs off-thread.
+    rx: Option<std::sync::mpsc::Receiver<Result<Option<purview::gotodef::Candidate>, String>>>,
     /// A status/error line shown in the overlay.
     note: String,
 }
@@ -172,6 +174,9 @@ struct App {
     selected: Option<Selection>,
     /// Hunk index whose comment editor is open in the bottom panel.
     active_hunk: Option<usize>,
+    /// True for the first frame after the comment editor opens via `c`, so the
+    /// TextEdit can grab keyboard focus once (the user can type immediately).
+    comment_just_opened: bool,
     layout: Layout,
     extent: Extent,
     /// Lazy repo file tree (children loaded via `self.repo` on first expand).
@@ -223,6 +228,12 @@ struct App {
     /// Set when a key-nav action wants the content scroll area moved to a
     /// specific vertical offset on the next frame.
     pending_scroll: Option<f32>,
+    /// Set by j/k when switching to a different changed file: scroll so that
+    /// file's FIRST hunk header is at the top. Resolved AFTER `ensure_cache`
+    /// rebuilds `hunk_rows` for the new file (the header row isn't known at
+    /// key-handling time, before the cache is built), so it works in both
+    /// Summary and Full extent where the first change may not be at row 0.
+    scroll_to_first_hunk: bool,
     /// Inline edit in full-file view: (cache row index = file line, buffer).
     /// Double-click a line (or `i` on a focused line) to start; Enter writes
     /// the edited line back to the file on disk, Esc cancels.
@@ -270,6 +281,7 @@ impl App {
             files: Vec::new(),
             selected: None,
             active_hunk: None,
+            comment_just_opened: false,
             layout: Layout::Inline,
             extent: Extent::Summary,
             tree_nodes,
@@ -293,6 +305,7 @@ impl App {
             lineno_width: 1,
             ui_scale: 1.0,
             pending_scroll: None,
+            scroll_to_first_hunk: false,
             editing: None,
             diff_rx: None,
             loading: false,
@@ -876,42 +889,24 @@ impl App {
             return;
         }
         let symbol = symbol.trim().to_string();
-        // Candidate-gathering (git grep) must run WHERE the repo lives, so it
-        // goes through the repo backend on this (main) thread — it's fast.
-        let cands = match self.repo.grep_symbol(&symbol) {
-            Ok(c) => c,
-            Err(e) => {
-                self.goto = Some(Goto {
-                    query: symbol,
-                    just_opened: false,
-                    resolving: false,
-                    rx: None,
-                    note: format!("grep failed: {e}"),
-                });
-                return;
-            }
-        };
-        if cands.is_empty() {
-            self.goto = Some(Goto {
-                query: symbol,
-                just_opened: false,
-                resolving: false,
-                rx: None,
-                note: "no candidates found".to_string(),
-            });
-            return;
-        }
-        // The Claude-CLI precision step runs WHERE the repo (and claude) live:
-        // locally for LocalRepo, on the remote over SSH for SshRepo. Route it
-        // through the repo backend (resolve_definition) on a background thread,
-        // sharing the backend via a cheap Arc clone.
+        // The ENTIRE pipeline runs off the UI thread: both git grep
+        // (candidate gathering) and the Claude-CLI precision step are
+        // potentially slow — over SSH the grep is a blocking remote round-trip
+        // that would freeze the app. Both run WHERE the repo (and claude) live,
+        // routed through the repo backend, on a background thread that shares
+        // the backend via a cheap Arc clone. The worker sends back the final
+        // resolved Candidate (or None, or an Err), polled by goto_overlay.
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_symbol = symbol.clone();
         let repo = std::sync::Arc::clone(&self.repo);
         std::thread::spawn(move || {
-            let res = repo
-                .resolve_definition(&worker_symbol, None, &cands)
-                .unwrap_or(None);
+            let res = (|| {
+                let cands = repo.grep_symbol(&worker_symbol)?;
+                if cands.is_empty() {
+                    return Ok(None);
+                }
+                repo.resolve_definition(&worker_symbol, None, &cands)
+            })();
             let _ = tx.send(res);
         });
         self.goto = Some(Goto {
@@ -925,7 +920,7 @@ impl App {
 
     fn goto_overlay(&mut self, ctx: &egui::Context) {
         // Poll the worker for a finished resolve, regardless of overlay focus.
-        let mut finished: Option<Option<purview::gotodef::Candidate>> = None;
+        let mut finished: Option<Result<Option<purview::gotodef::Candidate>, String>> = None;
         if let Some(go) = self.goto.as_mut() {
             if let Some(rx) = &go.rx {
                 if let Ok(res) = rx.try_recv() {
@@ -935,16 +930,23 @@ impl App {
         }
         if let Some(res) = finished {
             match res {
-                Some(cand) => {
+                Ok(Some(cand)) => {
                     self.selected = Some(Selection::Path(cand.file.clone()));
                     self.pending_line = Some(cand.line);
                     self.goto = None;
                 }
-                None => {
+                Ok(None) => {
                     if let Some(go) = self.goto.as_mut() {
                         go.resolving = false;
                         go.rx = None;
                         go.note = "no definition found".to_string();
+                    }
+                }
+                Err(e) => {
+                    if let Some(go) = self.goto.as_mut() {
+                        go.resolving = false;
+                        go.rx = None;
+                        go.note = format!("resolve failed: {e}");
                     }
                 }
             }
@@ -1224,8 +1226,18 @@ impl App {
             } else {
                 i.saturating_sub(1)
             };
+            if Some(next) != cur_file {
+                // Switching files: focus the new file's FIRST hunk and scroll
+                // it into view. Otherwise the view stays at the previous file's
+                // scroll offset and the user has to press `p` to reach the first
+                // change. The new file's hunk_rows aren't built until
+                // ensure_cache later this frame, so defer the scroll via a flag
+                // resolved there (works in both Summary and Full, where the
+                // first change may not sit at row 0).
+                self.focus_hunk = 0;
+                self.scroll_to_first_hunk = true;
+            }
             self.selected = Some(Selection::Changed(next));
-            self.focus_hunk = 0;
         }
 
         // n/p: move to the next/prev hunk RELATIVE TO THE CURRENT SCROLL
@@ -1250,8 +1262,13 @@ impl App {
                     self.focus_hunk = if n { self.hunk_rows.len() - 1 } else { 0 };
                 }
             }
+            // Only scroll when the target hunk is OUTSIDE the current viewport.
+            // If it's already on screen, just move focus and leave the user's
+            // scroll position untouched (don't yank them around).
             let row = self.hunk_rows.get(self.focus_hunk).copied().unwrap_or(0);
-            self.pending_scroll = Some(row as f32 * row_h);
+            if !row_in_viewport(row, top_row, bottom_row) {
+                self.pending_scroll = Some(row as f32 * row_h);
+            }
         }
 
         // a/r/c: act on the focused hunk (only meaningful for a changed file).
@@ -1271,6 +1288,9 @@ impl App {
                 set(self, ReviewStatus::Rejected);
             } else if c {
                 self.active_hunk = Some(self.focus_hunk);
+                // Grab keyboard focus on the editor next frame so the user can
+                // type immediately without a mouse click.
+                self.comment_just_opened = true;
             }
         }
     }
@@ -1670,6 +1690,10 @@ impl App {
             let header = self.files[f].hunks.get(h).map(|hk| hk.header.clone());
             if let Some(header) = header {
                 let mut changed = false;
+                // Set when this frame's keys should close the editor and return
+                // keyboard focus to the diff (n/p/a/r/c work again without a
+                // mouse click). Ctrl/Cmd+Enter submits (saves), Esc cancels.
+                let mut close_editor = false;
                 egui::TopBottomPanel::bottom("comment").resizable(true).show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Comment").strong());
@@ -1677,6 +1701,7 @@ impl App {
                         if ui.small_button("close").clicked() {
                             self.active_hunk = None;
                         }
+                        ui.weak("Ctrl+Enter to save · Esc to cancel");
                     });
                     let file_path = self.files[f].path.clone();
                     if let Some(hunk) = self.files[f].hunks.get_mut(h) {
@@ -1687,6 +1712,33 @@ impl App {
                                 .hint_text("why this needs changing / a question for the agent"),
                         );
                         changed = resp.changed();
+                        // Focus the editor the frame it opens via `c`.
+                        if self.comment_just_opened {
+                            resp.request_focus();
+                            self.comment_just_opened = false;
+                        }
+                        // Ctrl/Cmd+Enter submits; plain Enter falls through to
+                        // the TextEdit and inserts a newline. Consume the
+                        // modifier+Enter event so no newline is inserted. Esc
+                        // cancels. Both return focus to the diff (close_editor).
+                        if resp.has_focus() {
+                            let submit = ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
+                                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
+                            });
+                            let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if submit {
+                                changed = true; // persist the comment on save
+                                close_editor = true;
+                            } else if cancel {
+                                close_editor = true;
+                            }
+                            if close_editor {
+                                // Drop keyboard focus from the editor so the
+                                // diff's modal keys work again next frame.
+                                resp.surrender_focus();
+                            }
+                        }
                     }
                     // Agent replies on this hunk's thread (loaded once per
                     // frame at top level; see `replies`).
@@ -1707,6 +1759,11 @@ impl App {
                 });
                 if changed {
                     self.save_review_state();
+                }
+                if close_editor {
+                    // Close the editor; focus was already surrendered above so
+                    // the diff's modal keys (n/p/a/r/c) work again next frame.
+                    self.active_hunk = None;
                 }
             }
         }
@@ -1739,6 +1796,13 @@ impl App {
             if let Some(line) = self.pending_line.take() {
                 let target = line.saturating_sub(1).saturating_sub(8); // a little headroom
                 pending_v = Some(target as f32 * row_h);
+            }
+            // j/k file switch: now that ensure_cache has rebuilt hunk_rows for
+            // the newly selected file, scroll its first hunk header to the top.
+            if self.scroll_to_first_hunk {
+                self.scroll_to_first_hunk = false;
+                let first = self.hunk_rows.first().copied().unwrap_or(0);
+                pending_v = Some(first as f32 * row_h);
             }
 
             // Split layout draws two side-by-side panes that scroll
@@ -2297,6 +2361,14 @@ fn keybindings() -> &'static [(&'static str, &'static str)] {
 ///
 /// Returns the index INTO `hunk_rows`, or `None` if there is no hunk in that
 /// direction (caller keeps / clamps the focus).
+/// Whether cache `row` falls within the inclusive `[top_row, bottom_row]`
+/// viewport span (the rows currently on screen). Used by n/p to decide whether
+/// the target hunk needs scrolling into view: if it's already visible, focus
+/// moves but the scroll position is left alone.
+fn row_in_viewport(row: usize, top_row: usize, bottom_row: usize) -> bool {
+    row >= top_row && row <= bottom_row
+}
+
 fn nav_hunk_from_scroll(
     hunk_rows: &[usize],
     top_row: usize,
@@ -3267,6 +3339,95 @@ mod ui_tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A repo with TWO changed files, each carrying a single hunk near its top,
+    /// so j/k has somewhere to move and focus_hunk can be advanced first.
+    fn two_file_repo() -> PathBuf {
+        let (dir, git) = new_repo_dir();
+        let base: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("a.txt"), &base).unwrap();
+        std::fs::write(dir.join("b.txt"), &base).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        // Two well-separated edits in each file → ≥2 hunks per file.
+        let edited: String = (1..=30)
+            .map(|n| match n {
+                3 => "EDIT 3\n".to_string(),
+                27 => "EDIT 27\n".to_string(),
+                _ => format!("line {n}\n"),
+            })
+            .collect();
+        std::fs::write(dir.join("a.txt"), &edited).unwrap();
+        std::fs::write(dir.join("b.txt"), &edited).unwrap();
+        dir
+    }
+
+    /// Fix 3: pressing j/k to switch changed files resets focus to that file's
+    /// FIRST hunk. We first advance focus off hunk 0 with `n`, switch files with
+    /// `j`, and assert focus is back at 0 (so the view lands on the first
+    /// change instead of wherever the previous file's focus was).
+    #[test]
+    fn switching_files_resets_focus_to_first_hunk() {
+        let repo = two_file_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Summary;
+        app.selected = Some(Selection::Changed(0));
+        assert!(app.files.len() >= 2, "fixture must have ≥2 changed files");
+        assert!(app.files[0].hunks.len() >= 2, "file 0 needs ≥2 hunks for `n`");
+
+        let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        // Advance focus to a non-zero hunk in file 0.
+        harness.press_key(egui::Key::N);
+        harness.run();
+        assert_ne!(harness.state().focus_hunk, 0, "`n` should move focus off hunk 0");
+
+        // Switch to the next file: focus must reset to its first hunk.
+        harness.press_key(egui::Key::J);
+        harness.run();
+        let st = harness.state();
+        assert!(
+            matches!(st.selected, Some(Selection::Changed(1))),
+            "j moves to the next changed file"
+        );
+        assert_eq!(
+            st.focus_hunk, 0,
+            "switching files lands on the new file's FIRST hunk"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Fix 1: F12 must NOT block the UI thread — the whole go-to-definition
+    /// pipeline (git grep + resolve) runs off-thread. Pressing F12 on a symbol
+    /// should IMMEDIATELY return control with the Goto overlay in its
+    /// "resolving" state and a live receiver, before any grep/resolve work has
+    /// completed on the worker. (If grep ran on the UI thread, this frame would
+    /// have blocked on it instead of returning a resolving overlay.)
+    #[test]
+    fn f12_starts_resolve_off_thread_without_blocking() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        // Target any symbol; start_goto spawns the worker regardless of how many
+        // candidates grep finds — the point is that nothing blocks here.
+        app.selected_symbol = Some("two".to_string());
+
+        let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        harness.press_key(egui::Key::F12);
+        harness.run();
+
+        // Control returned to us on the very next frame — the call did NOT
+        // block on git grep. The overlay is present in its resolving state with
+        // a live worker receiver (the grep+resolve are off-thread). We read
+        // state immediately so the worker is still in flight; if grep had run
+        // on the UI thread this frame would have blocked on it instead.
+        let st = harness.state();
+        let go = st.goto.as_ref().expect("F12 opens the Go-to-definition overlay");
+        assert!(go.resolving, "overlay is in the resolving state right after F12");
+        assert!(go.rx.is_some(), "a worker receiver is in place (pipeline is off-thread)");
+        assert_eq!(go.query, "two");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // ===================================================================
     // Bug 4 — display / rendering edge cases.
     // ===================================================================
@@ -3545,6 +3706,28 @@ mod ui_tests {
         // Empty hunk list → no target either way.
         assert_eq!(nav_hunk_from_scroll(&[], 0, 10, 0, true), None);
         assert_eq!(nav_hunk_from_scroll(&[], 0, 10, 0, false), None);
+    }
+
+    /// Fix 2: the "should I scroll?" decision for n/p. A target row inside the
+    /// inclusive [top,bottom] viewport is already on screen → DON'T scroll (so
+    /// the user keeps their place); a row above the top or below the bottom is
+    /// off-screen → scroll it into view.
+    #[test]
+    fn row_in_viewport_decides_scroll_vs_keep_place() {
+        // Viewport spans rows 10..=20 inclusive.
+        // Inside (incl. both edges) → visible → no scroll.
+        assert!(row_in_viewport(10, 10, 20), "top edge counts as visible");
+        assert!(row_in_viewport(15, 10, 20), "mid-viewport is visible");
+        assert!(row_in_viewport(20, 10, 20), "bottom edge counts as visible");
+        // Outside → off-screen → scroll.
+        assert!(!row_in_viewport(9, 10, 20), "one above the top is off-screen");
+        assert!(!row_in_viewport(21, 10, 20), "one below the bottom is off-screen");
+        assert!(!row_in_viewport(0, 10, 20), "well above is off-screen");
+        assert!(!row_in_viewport(100, 10, 20), "well below is off-screen");
+        // Degenerate single-row viewport (viewport_h ~0 on first frame): only
+        // that exact row is "visible".
+        assert!(row_in_viewport(5, 5, 5));
+        assert!(!row_in_viewport(6, 5, 5));
     }
 
     // ===================================================================
