@@ -267,6 +267,10 @@ struct App {
     /// True for the first frame after the comment editor opens via `c`, so the
     /// TextEdit can grab keyboard focus once (the user can type immediately).
     comment_just_opened: bool,
+    /// The open comment has unsaved edits. We persist on editor close (not per
+    /// keystroke) so typing doesn't trigger a full serialize + ssh round-trip
+    /// each character.
+    comment_dirty: bool,
     layout: Layout,
     extent: Extent,
     /// Lazy repo file tree (children loaded via `self.repo` on first expand).
@@ -416,6 +420,7 @@ impl App {
             selected: None,
             active_hunk: None,
             comment_just_opened: false,
+            comment_dirty: false,
             layout: Layout::Inline,
             extent: Extent::Summary,
             tree_nodes,
@@ -485,6 +490,12 @@ impl App {
     /// picked up by `poll_reload`, which ignores any result whose `generation`
     /// has since been superseded by a newer reload (race guard).
     fn reload(&mut self) {
+        // Flush any unsaved comment before we drop the files — the comment
+        // editor persists on close, but a reload mid-edit shouldn't lose it.
+        if self.comment_dirty {
+            self.save_review_state();
+            self.comment_dirty = false;
+        }
         self.files.clear();
         self.selected = None;
         self.active_hunk = None;
@@ -2116,10 +2127,19 @@ impl App {
                         });
                     }
                 });
+                // Mark dirty on edit, but DON'T persist per keystroke —
+                // save_review_state serializes the whole state and (in ssh mode)
+                // does a remote round-trip, which makes typing lag badly. The
+                // in-memory comment is already updated live; flush to disk/remote
+                // only when the editor closes (submit / cancel / blur).
                 if changed {
-                    self.save_review_state();
+                    self.comment_dirty = true;
                 }
                 if close_editor {
+                    if self.comment_dirty {
+                        self.save_review_state();
+                        self.comment_dirty = false;
+                    }
                     // Close the editor; focus was already surrendered above so
                     // the diff's modal keys (n/p/a/r/c) work again next frame.
                     self.active_hunk = None;
