@@ -121,7 +121,7 @@ enum RenderRow {
 
 struct App {
     /// Repo backend — local (git2 + fs) or SSH. The UI only talks to this.
-    repo: Box<dyn RepoSource>,
+    repo: std::sync::Arc<dyn RepoSource>,
     branch: String,
     base: String,
     base_input: String,
@@ -183,6 +183,9 @@ struct App {
 
 impl App {
     fn new(repo: Box<dyn RepoSource>) -> Self {
+        // Share the backend behind an Arc so the go-to-definition worker thread
+        // can hold its own clone (the Claude precision step runs there).
+        let repo: std::sync::Arc<dyn RepoSource> = std::sync::Arc::from(repo);
         let state_root = repo.state_root().to_path_buf();
         // Root-level tree nodes (lazy; children load on expand via self.repo).
         let tree_nodes = repo
@@ -651,12 +654,17 @@ impl App {
             });
             return;
         }
-        // The Claude-CLI precision step always runs LOCALLY (claude isn't on
-        // the remote), so spawn it on a background thread with the candidates.
+        // The Claude-CLI precision step runs WHERE the repo (and claude) live:
+        // locally for LocalRepo, on the remote over SSH for SshRepo. Route it
+        // through the repo backend (resolve_definition) on a background thread,
+        // sharing the backend via a cheap Arc clone.
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_symbol = symbol.clone();
+        let repo = std::sync::Arc::clone(&self.repo);
         std::thread::spawn(move || {
-            let res = purview::gotodef::resolve_with_claude(&worker_symbol, None, &cands);
+            let res = repo
+                .resolve_definition(&worker_symbol, None, &cands)
+                .unwrap_or(None);
             let _ = tx.send(res);
         });
         self.goto = Some(Goto {

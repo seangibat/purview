@@ -76,9 +76,18 @@ pub fn grep_candidates(root: &Path, symbol: &str) -> Vec<Candidate> {
     parse_grep_output(&stdout)
 }
 
+/// The Claude-CLI args (excluding the prompt itself) used for the precision
+/// step. Shared so the local and SSH backends invoke `claude` identically.
+/// The prompt is passed however the backend prefers (positional arg locally,
+/// or over ssh stdin remotely — the CLI accepts either).
+pub fn claude_args() -> [&'static str; 3] {
+    ["-p", "--model", MODEL]
+}
+
 /// Build the precision prompt: numbered candidates, ask for the definition's
-/// index (1-based) or 0.
-fn build_prompt(symbol: &str, usage: Option<&str>, cands: &[Candidate]) -> String {
+/// index (1-based) or 0. Shared verbatim by both backends so local and remote
+/// resolution see identical input.
+pub fn build_prompt(symbol: &str, usage: Option<&str>, cands: &[Candidate]) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "You are locating where the symbol `{symbol}` is DEFINED or DECLARED \
@@ -98,27 +107,30 @@ fn build_prompt(symbol: &str, usage: Option<&str>, cands: &[Candidate]) -> Strin
     s
 }
 
-/// Ask the Claude CLI to pick the defining candidate. Returns the chosen
-/// candidate, or None. Blocking (run on a background thread).
-pub fn resolve_with_claude(
-    symbol: &str,
-    usage: Option<&str>,
-    cands: &[Candidate],
-) -> Option<Candidate> {
-    if cands.is_empty() {
-        return None;
-    }
-    if cands.len() == 1 {
-        return Some(cands[0].clone());
-    }
-    let prompt = build_prompt(symbol, usage, cands);
+/// Run the local `claude` CLI on `prompt`, returning its stdout. This is the
+/// exact invocation `LocalRepo` uses; the SSH backend runs the SAME command on
+/// the remote instead. Blocking.
+pub fn run_claude_local(prompt: &str) -> Result<String, String> {
     let out = Command::new("claude")
-        .args(["-p", "--model", MODEL])
-        .arg(&prompt)
+        .args(claude_args())
+        .arg(prompt)
         .output()
-        .ok()?;
-    let reply = String::from_utf8_lossy(&out.stdout);
-    let n = parse_choice(&reply)?;
+        .map_err(|e| format!("claude: failed to launch: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "claude exited non-zero: {}",
+            err.trim().lines().next().unwrap_or("(no stderr)")
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Turn the Claude CLI's reply into the chosen candidate. Shared by both
+/// backends so the reply→candidate mapping (and the "0 = none" convention) is
+/// identical regardless of where `claude` ran.
+pub fn pick_candidate(reply: &str, cands: &[Candidate]) -> Option<Candidate> {
+    let n = parse_choice(reply)?;
     if n == 0 {
         return None;
     }
@@ -136,10 +148,21 @@ fn parse_choice(reply: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-/// Full pipeline: grep then resolve. Blocking.
+/// Full LOCAL pipeline: grep then resolve via the local `claude` CLI. Blocking.
+/// The trait method [`RepoSource::resolve_definition`](crate::repo::RepoSource::resolve_definition)
+/// is the production entry point (it runs `claude` where the repo lives); this
+/// stays as a convenience for the local case.
 pub fn find_definition(root: &Path, symbol: &str, usage: Option<&str>) -> Option<Candidate> {
     let cands = grep_candidates(root, symbol);
-    resolve_with_claude(symbol, usage, &cands)
+    if cands.is_empty() {
+        return None;
+    }
+    if cands.len() == 1 {
+        return Some(cands[0].clone());
+    }
+    let prompt = build_prompt(symbol, usage, &cands);
+    let reply = run_claude_local(&prompt).ok()?;
+    pick_candidate(&reply, &cands)
 }
 
 #[cfg(test)]
@@ -153,6 +176,27 @@ mod tests {
         assert_eq!(parse_choice("The answer is 12."), Some(12));
         assert_eq!(parse_choice("0"), Some(0));
         assert_eq!(parse_choice("none"), None);
+    }
+
+    #[test]
+    fn claude_args_are_stable() {
+        // Both backends invoke `claude` with exactly these args (+ the prompt),
+        // so local and remote resolution are identical. Lock the shape.
+        assert_eq!(claude_args(), ["-p", "--model", MODEL]);
+    }
+
+    #[test]
+    fn pick_candidate_maps_reply_to_candidate() {
+        let cands = vec![
+            Candidate { file: "a.rs".into(), line: 1, text: "fn foo".into() },
+            Candidate { file: "b.rs".into(), line: 9, text: "foo()".into() },
+        ];
+        // 1-based index; "0" and out-of-range / junk → None.
+        assert_eq!(pick_candidate("1", &cands), Some(cands[0].clone()));
+        assert_eq!(pick_candidate("2\n", &cands), Some(cands[1].clone()));
+        assert_eq!(pick_candidate("0", &cands), None);
+        assert_eq!(pick_candidate("9", &cands), None);
+        assert_eq!(pick_candidate("none", &cands), None);
     }
 
     #[test]

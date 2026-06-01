@@ -201,6 +201,20 @@ impl SshRepo {
     /// Used for write-back: the file content goes over stdin (so it never needs
     /// shell-quoting), and the remote `cat > tmp && mv tmp dst` does the write.
     fn run_remote_stdin(&self, remote_cmd: &str, input: &[u8]) -> Result<(), String> {
+        self.run_remote_stdin_out(remote_cmd, input, "remote write failed")
+            .map(|_| ())
+    }
+
+    /// Like [`run_remote_stdin`] but RETURNS the remote command's stdout. Used
+    /// for go-to-definition: the (untrusted-length) prompt goes over stdin so it
+    /// never needs shell-quoting, and we need `claude`'s reply back. `err_label`
+    /// prefixes the error on a non-zero exit.
+    fn run_remote_stdin_out(
+        &self,
+        remote_cmd: &str,
+        input: &[u8],
+        err_label: &str,
+    ) -> Result<String, String> {
         use std::io::Write;
         use std::process::Stdio;
 
@@ -215,7 +229,7 @@ impl SshRepo {
             .spawn()
             .map_err(|e| format!("ssh exec failed: {e}"))?;
         // Take stdin and write in a scope so it's dropped (closed) before we
-        // wait — otherwise the remote `cat` blocks for EOF and we deadlock.
+        // wait — otherwise the remote command blocks for EOF and we deadlock.
         {
             let mut stdin = child
                 .stdin
@@ -223,7 +237,7 @@ impl SshRepo {
                 .ok_or_else(|| "ssh: could not open stdin".to_string())?;
             stdin
                 .write_all(input)
-                .map_err(|e| format!("ssh: failed writing remote file: {e}"))?;
+                .map_err(|e| format!("ssh: failed writing to remote stdin: {e}"))?;
         }
         let out = child
             .wait_with_output()
@@ -231,11 +245,11 @@ impl SshRepo {
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             return Err(format!(
-                "remote write failed: {}",
+                "{err_label}: {}",
                 err.trim().lines().next().unwrap_or("(no stderr)")
             ));
         }
-        Ok(())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Resolve the merge-base tree-ish for BranchRange (mirrors LocalRepo:
@@ -425,13 +439,42 @@ impl RepoSource for SshRepo {
         }
     }
 
+    fn resolve_definition(
+        &self,
+        symbol: &str,
+        usage: Option<&str>,
+        cands: &[Candidate],
+    ) -> Result<Option<Candidate>, String> {
+        // Same short-circuits as the default impl (no model call needed).
+        if cands.is_empty() {
+            return Ok(None);
+        }
+        if cands.len() == 1 {
+            return Ok(Some(cands[0].clone()));
+        }
+        // Run the SAME `claude` command as the local backend, but on the REMOTE
+        // (where the code and `claude` live). The prompt is built by the shared
+        // helper so it's byte-identical to local, and streamed over ssh stdin so
+        // it never needs shell-quoting (it can be large / contain anything).
+        let prompt = crate::gotodef::build_prompt(symbol, usage, cands);
+        // Remote: `cd '<repo>' && claude -p --model <MODEL>` reading stdin.
+        let mut remote = format!("cd {} && claude", shell_quote(&self.target.path));
+        for a in crate::gotodef::claude_args() {
+            remote.push(' ');
+            remote.push_str(&shell_quote(a));
+        }
+        let reply =
+            self.run_remote_stdin_out(&remote, prompt.as_bytes(), "remote claude failed")?;
+        Ok(crate::gotodef::pick_candidate(&reply, cands))
+    }
+
     fn supports_editing(&self) -> bool {
         true
     }
 
     fn supports_goto(&self) -> bool {
-        // git grep runs on the remote (grep_symbol); the Claude-CLI precision
-        // step runs locally where purview runs.
+        // git grep AND the Claude-CLI precision step both run on the remote
+        // (grep_symbol + resolve_definition), where the code and `claude` live.
         true
     }
 

@@ -28,7 +28,7 @@ pub use ssh::{SshRepo, SshTarget};
 /// Methods return `String` errors (already human-readable) rather than a
 /// concrete error type, because the two backends fail in very different ways
 /// (git2::Error vs. a non-zero ssh exit) and the UI only ever shows the text.
-pub trait RepoSource {
+pub trait RepoSource: Send + Sync {
     /// Current branch shorthand + the changed files (grouped into hunks) for
     /// `source`. `base` is only used for [`DiffSource::BranchRange`]. Mirrors
     /// [`diff::compute`].
@@ -75,6 +75,33 @@ pub trait RepoSource {
     /// Claude-CLI precision step. Identifier-ish symbols only (the caller and
     /// each impl guard against shell/regex surprises).
     fn grep_symbol(&self, symbol: &str) -> Result<Vec<Candidate>, String>;
+
+    /// Pick the defining candidate among `cands` for `symbol` by running the
+    /// Claude CLI precision step WHERE the repo (and `claude`) live: locally for
+    /// [`LocalRepo`], on the remote over SSH for [`SshRepo`]. `usage` is the
+    /// optional call-site hint. Blocking — call from a background thread.
+    ///
+    /// The default impl runs `claude` locally (correct for [`LocalRepo`]); the
+    /// SSH backend overrides it to run the SAME command on the remote. The
+    /// prompt is built by the shared `gotodef::build_prompt` so both backends
+    /// send byte-identical input.
+    fn resolve_definition(
+        &self,
+        symbol: &str,
+        usage: Option<&str>,
+        cands: &[Candidate],
+    ) -> Result<Option<Candidate>, String> {
+        // Short-circuits shared by every backend (no model call needed).
+        if cands.is_empty() {
+            return Ok(None);
+        }
+        if cands.len() == 1 {
+            return Ok(Some(cands[0].clone()));
+        }
+        let prompt = crate::gotodef::build_prompt(symbol, usage, cands);
+        let reply = crate::gotodef::run_claude_local(&prompt)?;
+        Ok(crate::gotodef::pick_candidate(&reply, cands))
+    }
 
     /// Whether inline editing (write-back) is supported. The UI hides/disables
     /// the edit affordance and shows a note when false.
