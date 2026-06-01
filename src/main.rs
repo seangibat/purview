@@ -447,8 +447,9 @@ impl App {
     }
 
     /// Build a markdown review report — the artifact to hand to Claude.
-    /// Summarizes counts, then lists rejected and unreviewed hunks (the
-    /// things that need attention) per file.
+    /// A COMPLETE record: counts, then Rejected / Approved / Unreviewed
+    /// sections per file. Every hunk carries its comment regardless of
+    /// status, so a comment on a hunk you didn't approve/reject isn't lost.
     fn review_report(&self) -> String {
         let (rev, tot) = self.review_totals();
         let approved = self.count_status(ReviewStatus::Approved);
@@ -465,57 +466,42 @@ impl App {
             tot.saturating_sub(rev)
         ));
 
-        let mut wrote_rejected = false;
-        for f in &self.files {
-            let rej: Vec<&Hunk> = f
-                .hunks
-                .iter()
-                .filter(|h| h.status == ReviewStatus::Rejected)
-                .collect();
-            if rej.is_empty() {
-                continue;
-            }
-            if !wrote_rejected {
-                s.push_str("## Rejected hunks (need changes)\n\n");
-                wrote_rejected = true;
-            }
-            s.push_str(&format!("### {}\n\n", f.path));
-            for h in rej {
-                s.push_str(&format!("- `{}`\n", h.header.trim()));
-                // Carry the reviewer's comment so a pasted report has the
-                // "why", not just which hunk — parity with the MCP path.
-                if !h.comment.trim().is_empty() {
-                    for line in h.comment.trim().lines() {
-                        s.push_str(&format!("  - {line}\n"));
+        // One section per status, in review-priority order. Each lists the
+        // matching hunks per file, with the reviewer's comment underneath so
+        // the "why" survives — comments are carried for EVERY status, not just
+        // rejected (a comment on an approved/unreviewed hunk used to vanish).
+        let section = |s: &mut String, title: &str, status: ReviewStatus| {
+            let mut wrote = false;
+            for f in &self.files {
+                let matching: Vec<&Hunk> =
+                    f.hunks.iter().filter(|h| h.status == status).collect();
+                if matching.is_empty() {
+                    continue;
+                }
+                if !wrote {
+                    s.push_str(&format!("## {title}\n\n"));
+                    wrote = true;
+                }
+                s.push_str(&format!("### {}\n\n", f.path));
+                for h in matching {
+                    s.push_str(&format!("- `{}`\n", h.header.trim()));
+                    if !h.comment.trim().is_empty() {
+                        for line in h.comment.trim().lines() {
+                            s.push_str(&format!("  - {line}\n"));
+                        }
                     }
                 }
+                s.push('\n');
             }
-            s.push('\n');
-        }
+            wrote
+        };
 
-        let mut wrote_unrev = false;
-        for f in &self.files {
-            let un: Vec<&Hunk> = f
-                .hunks
-                .iter()
-                .filter(|h| h.status == ReviewStatus::Unreviewed)
-                .collect();
-            if un.is_empty() {
-                continue;
-            }
-            if !wrote_unrev {
-                s.push_str("## Still unreviewed\n\n");
-                wrote_unrev = true;
-            }
-            s.push_str(&format!("### {}\n\n", f.path));
-            for h in un {
-                s.push_str(&format!("- `{}`\n", h.header.trim()));
-            }
-            s.push('\n');
-        }
+        let wrote_rejected = section(&mut s, "Rejected hunks (need changes)", ReviewStatus::Rejected);
+        let wrote_approved = section(&mut s, "Approved hunks", ReviewStatus::Approved);
+        let wrote_unrev = section(&mut s, "Still unreviewed", ReviewStatus::Unreviewed);
 
-        if !wrote_rejected && !wrote_unrev {
-            s.push_str("All hunks approved. ✓\n");
+        if !wrote_rejected && !wrote_approved && !wrote_unrev {
+            s.push_str("No changes to review.\n");
         }
         s
     }
@@ -3924,6 +3910,32 @@ mod ui_tests {
         let applied = app.poll_reload();
         assert!(!applied, "a superseded result must not be applied");
         assert_ne!(app.branch, "zzz-stale", "stale branch must not leak in");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn report_includes_approved_and_carries_comments_for_any_status() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        app.poll_reload_blocking();
+        assert!(
+            !app.files.is_empty() && !app.files[0].hunks.is_empty(),
+            "fixture should produce at least one hunk"
+        );
+
+        // Approve the first hunk AND leave a comment on it (no reject).
+        app.files[0].hunks[0].status = ReviewStatus::Approved;
+        app.files[0].hunks[0].comment = "looks good but consider edge case".to_string();
+
+        let report = app.review_report();
+        assert!(
+            report.contains("## Approved hunks"),
+            "report must have an Approved section:\n{report}"
+        );
+        assert!(
+            report.contains("looks good but consider edge case"),
+            "a comment on an APPROVED hunk must appear (it used to be dropped):\n{report}"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
