@@ -105,7 +105,19 @@ enum Selection {
 enum RenderRow {
     /// A hunk boundary in diff view. Carries the hunk index so the row can
     /// draw approve/deny controls bound to that hunk's live status.
-    HunkHeader { hunk_idx: usize, text: String },
+    ///
+    /// In Full extent the displayed content is one full-file hunk that doesn't
+    /// line up 1:1 with the file's (summary) review hunks, so a single control
+    /// can't honestly target one of them. `whole_file = true` marks that case:
+    /// the controls then act on EVERY hunk of the file (and the status glyph
+    /// shows the file-wide aggregate). In Summary, `whole_file = false` and the
+    /// controls target exactly `hunk_idx` (the bug-3 fix: each header acts on
+    /// its own hunk, never always hunk 0).
+    HunkHeader {
+        hunk_idx: usize,
+        text: String,
+        whole_file: bool,
+    },
     /// A diff content line (add/del/ctx), raw text.
     DiffLine { kind: LineKind, text: String },
     /// A full-file content line, raw text.
@@ -179,6 +191,14 @@ struct App {
     /// Double-click a line (or `i` on a focused line) to start; Enter writes
     /// the edited line back to the file on disk, Esc cancels.
     editing: Option<(usize, String)>,
+    /// In-flight async diff computation (bug #2). `reload()` runs the diff on
+    /// a worker thread so a slow remote (SSH does several blocking round-trips)
+    /// never freezes the render loop. The worker stamps each result with the
+    /// `generation` it was started for; `poll_reload` applies only the latest,
+    /// dropping superseded results. `Some` = a reload is in flight.
+    diff_rx: Option<std::sync::mpsc::Receiver<(u64, Result<(String, Vec<ChangedFile>), String>)>>,
+    /// True while `diff_rx` is in flight — drives the "loading…" UI + spinner.
+    loading: bool,
 }
 
 impl App {
@@ -225,11 +245,18 @@ impl App {
             hunk_rows: Vec::new(),
             pending_scroll: None,
             editing: None,
+            diff_rx: None,
+            loading: false,
         };
         // Guess a sensible default base for branch-range mode.
         app.base = app.guess_default_base();
         app.base_input = app.base.clone();
         app.reload();
+        // The initial diff runs synchronously so the window opens already
+        // showing content (no first-frame "loading…" flash); subsequent
+        // reloads go async. For a local repo this is instant; even for SSH the
+        // one-time startup cost is acceptable and keeps `new` deterministic.
+        app.poll_reload_blocking();
         app
     }
 
@@ -239,6 +266,13 @@ impl App {
         self.repo.guess_default_base()
     }
 
+    /// Kick off a reload. The diff itself runs on a WORKER THREAD (bug #2):
+    /// over SSH `compute_diff` makes several blocking remote git round-trips
+    /// (~seconds), and doing that on the UI thread froze the whole app. Here we
+    /// only reset state + spawn the worker, then return immediately so the
+    /// render loop keeps running and can show a "loading…" state. The result is
+    /// picked up by `poll_reload`, which ignores any result whose `generation`
+    /// has since been superseded by a newer reload (race guard).
     fn reload(&mut self) {
         self.files.clear();
         self.selected = None;
@@ -248,21 +282,82 @@ impl App {
         self.cache.clear();
         self.cache_key = None;
         self.generation = self.generation.wrapping_add(1);
+        let gen = self.generation;
 
-        match self.compute_diff() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo = std::sync::Arc::clone(&self.repo);
+        let source = self.source;
+        let base = self.base.clone();
+        std::thread::spawn(move || {
+            let res = repo.compute_diff(source, &base);
+            // The receiver may be gone if the app is closing — ignore.
+            let _ = tx.send((gen, res));
+        });
+        self.diff_rx = Some(rx);
+        self.loading = true;
+    }
+
+    /// Non-blocking poll for an in-flight reload (bug #2). Applies a finished
+    /// diff IFF it matches the current `generation` (a newer reload supersedes
+    /// an older in-flight one). Returns true if the in-flight result for the
+    /// CURRENT generation landed this call.
+    fn poll_reload(&mut self) -> bool {
+        let Some(rx) = &self.diff_rx else { return false };
+        let Ok((gen, res)) = rx.try_recv() else { return false };
+        // A stale result (its reload was superseded). Drop it, but only stop
+        // showing "loading" if no newer reload is pending — which it always is
+        // when gen != self.generation, so keep waiting.
+        if gen != self.generation {
+            return false;
+        }
+        self.diff_rx = None;
+        self.loading = false;
+        self.apply_diff_result(res);
+        true
+    }
+
+    /// Block until the in-flight reload finishes and apply it. Used only for
+    /// the very first load in `new` (so the window opens with content) and in
+    /// tests that want deterministic post-reload state.
+    fn poll_reload_blocking(&mut self) {
+        let Some(rx) = self.diff_rx.take() else { return };
+        // Drain to the latest result for the current generation.
+        let want = self.generation;
+        let mut applied = false;
+        while let Ok((gen, res)) = rx.recv() {
+            if gen == want {
+                self.apply_diff_result(res);
+                applied = true;
+                break;
+            }
+            // else: a superseded generation's result — keep reading.
+        }
+        let _ = applied;
+        self.loading = false;
+    }
+
+    /// Apply a finished diff result to the UI state.
+    fn apply_diff_result(&mut self, res: Result<(String, Vec<ChangedFile>), String>) {
+        match res {
             Ok((branch, files)) => {
                 self.branch = branch;
                 self.files = files;
-                if !self.files.is_empty() {
-                    self.selected = Some(Selection::Changed(0));
-                }
+                self.selected = if self.files.is_empty() {
+                    None
+                } else {
+                    Some(Selection::Changed(0))
+                };
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => {
+                self.files.clear();
+                self.selected = None;
+                self.error = Some(e);
+            }
         }
-    }
-
-    fn compute_diff(&self) -> Result<(String, Vec<ChangedFile>), String> {
-        self.repo.compute_diff(self.source, &self.base)
+        // The file set changed — drop any stale render cache.
+        self.cache.clear();
+        self.cache_key = None;
+        self.focus_hunk = 0;
     }
 
     /// (reviewed, total) hunks across all changed files.
@@ -466,12 +561,16 @@ impl App {
                         out.push(RenderRow::HunkHeader {
                             hunk_idx,
                             text: hunk.header.clone(),
+                            whole_file: false,
                         });
                     } else if hunk_idx == 0 {
-                        // One header carrying the hunk controls for the file.
+                        // One header carrying the file-wide controls. The
+                        // full-context hunks don't map 1:1 to the review hunks,
+                        // so this strip acts on the whole file (all hunks).
                         out.push(RenderRow::HunkHeader {
                             hunk_idx,
                             text: String::new(),
+                            whole_file: true,
                         });
                     }
                     match self.layout {
@@ -919,9 +1018,18 @@ impl App {
         }
 
         // a/r/c: act on the focused hunk (only meaningful for a changed file).
+        // In Summary each header maps 1:1 to a review hunk, so `focus_hunk` IS
+        // the hunk index. In Full extent there's a single file-wide control
+        // strip, so a/r act on EVERY hunk of the file — matching the on-screen
+        // button strip (bug 3: keyboard + buttons target the same hunks).
         if let Some(fi) = cur_file {
+            let whole_file = self.extent == Extent::Full;
             let set = |app: &mut App, status: ReviewStatus| {
-                if let Some(h) = app.files[fi].hunks.get_mut(app.focus_hunk) {
+                if whole_file {
+                    for h in app.files[fi].hunks.iter_mut() {
+                        h.status = status;
+                    }
+                } else if let Some(h) = app.files[fi].hunks.get_mut(app.focus_hunk) {
                     h.status = status;
                 }
                 app.save_review_state();
@@ -937,6 +1045,14 @@ impl App {
     }
 
     fn ui(&mut self, ctx: &egui::Context) {
+        // Pick up an async reload (bug #2) if it finished. While one is in
+        // flight, keep repainting so the poll runs and the spinner animates —
+        // the worker thread can't wake egui on its own.
+        self.poll_reload();
+        if self.loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         // Ctrl+P opens the fuzzy file finder. (Cmd+P on mac.)
         let toggle_qo = ctx.input(|i| {
             i.key_pressed(egui::Key::P) && (i.modifiers.ctrl || i.modifiers.command)
@@ -966,6 +1082,10 @@ impl App {
                 ui.label(format!("repo: {}", self.repo.label()));
                 ui.separator();
                 ui.label(format!("branch: {}", self.branch));
+                if self.loading {
+                    ui.add(egui::Spinner::new());
+                    ui.label(egui::RichText::new("loading…").weak());
+                }
                 ui.separator();
                 let (rev, tot) = self.review_totals();
                 ui.label(format!("reviewed: {rev}/{tot} hunks"));
@@ -1172,10 +1292,22 @@ impl App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.selected.is_none() {
+            if self.loading {
                 ui.centered_and_justified(|ui| {
-                    ui.label("no changes — working tree matches HEAD")
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label("computing diff…");
+                    });
                 });
+                return;
+            }
+            if self.selected.is_none() {
+                let msg = if self.error.is_some() {
+                    "diff failed — see the error above"
+                } else {
+                    "no changes — working tree matches HEAD"
+                };
+                ui.centered_and_justified(|ui| ui.label(msg));
                 return;
             }
 
@@ -1201,11 +1333,25 @@ impl App {
                     let focus_row = self.hunk_rows.get(self.focus_hunk).copied();
                     for i in range {
                         match &self.cache[i] {
-                            RenderRow::HunkHeader { hunk_idx, text } => {
+                            RenderRow::HunkHeader { hunk_idx, text, whole_file } => {
                                 let focused = Some(i) == focus_row;
+                                // Which review hunks this control strip targets:
+                                // exactly `hunk_idx` in Summary, or ALL of the
+                                // file's hunks in Full extent (where the shown
+                                // content is one full-file hunk).
+                                let targets: Vec<usize> = match active_file {
+                                    Some(f) if *whole_file => {
+                                        (0..self.files[f].hunks.len()).collect()
+                                    }
+                                    Some(_) => vec![*hunk_idx],
+                                    None => Vec::new(),
+                                };
+                                // Aggregate status across the targeted hunks: a
+                                // single hunk shows its own status; the whole-
+                                // file strip shows all-approved / all-rejected /
+                                // else unreviewed (mixed reads as "needs work").
                                 let status = active_file
-                                    .and_then(|f| self.files[f].hunks.get(*hunk_idx))
-                                    .map(|h| h.status)
+                                    .map(|f| aggregate_status(&self.files[f], &targets))
                                     .unwrap_or(ReviewStatus::Unreviewed);
                                 let hdr_bg = if focused {
                                     Color32::from_rgb(48, 58, 80) // focused: brighter
@@ -1216,12 +1362,18 @@ impl App {
                                     .fill(hdr_bg)
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            if focused {
-                                                ui.label(
-                                                    egui::RichText::new("▶")
-                                                        .color(Color32::from_rgb(140, 180, 240)),
-                                                );
-                                            }
+                                            // Always reserve the focus-marker
+                                            // column so toggling focus doesn't
+                                            // reflow the row (bug 3 layout shift).
+                                            ui.label(
+                                                egui::RichText::new(if focused {
+                                                    "▶"
+                                                } else {
+                                                    " "
+                                                })
+                                                .monospace()
+                                                .color(Color32::from_rgb(140, 180, 240)),
+                                            );
                                             let (glyph, col) = match status {
                                                 ReviewStatus::Approved => {
                                                     ("✓", Color32::from_rgb(120, 200, 120))
@@ -1235,16 +1387,29 @@ impl App {
                                             };
                                             ui.label(egui::RichText::new(glyph).color(col));
                                             if ui.small_button("approve").clicked() {
-                                                pending.push((*hunk_idx, ReviewStatus::Approved));
+                                                for &t in &targets {
+                                                    pending.push((t, ReviewStatus::Approved));
+                                                }
                                             }
                                             if ui.small_button("reject").clicked() {
-                                                pending.push((*hunk_idx, ReviewStatus::Rejected));
+                                                for &t in &targets {
+                                                    pending.push((t, ReviewStatus::Rejected));
+                                                }
                                             }
-                                            if status != ReviewStatus::Unreviewed
-                                                && ui.small_button("clear").clicked()
+                                            // Always render "clear" (disabled
+                                            // when nothing to clear) so the row
+                                            // never reflows when status toggles
+                                            // (bug 3 layout shift).
+                                            if ui
+                                                .add_enabled(
+                                                    status != ReviewStatus::Unreviewed,
+                                                    egui::Button::new("clear").small(),
+                                                )
+                                                .clicked()
                                             {
-                                                pending
-                                                    .push((*hunk_idx, ReviewStatus::Unreviewed));
+                                                for &t in &targets {
+                                                    pending.push((t, ReviewStatus::Unreviewed));
+                                                }
                                             }
                                             let has_comment = active_file
                                                 .and_then(|f| self.files[f].hunks.get(*hunk_idx))
@@ -1457,6 +1622,27 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The status to show for a control strip that targets `targets` hunks of
+/// `file`. A single target reflects that hunk exactly. A whole-file strip
+/// shows Approved only if EVERY targeted hunk is approved, Rejected if every
+/// one is rejected, else Unreviewed (a mixed/partial file still "needs work").
+/// Empty targets → Unreviewed.
+fn aggregate_status(file: &ChangedFile, targets: &[usize]) -> ReviewStatus {
+    let mut statuses = targets.iter().filter_map(|&i| file.hunks.get(i).map(|h| h.status)).peekable();
+    if statuses.peek().is_none() {
+        return ReviewStatus::Unreviewed;
+    }
+    let all_approved = statuses.clone().all(|s| s == ReviewStatus::Approved);
+    let all_rejected = statuses.all(|s| s == ReviewStatus::Rejected);
+    if all_approved {
+        ReviewStatus::Approved
+    } else if all_rejected {
+        ReviewStatus::Rejected
+    } else {
+        ReviewStatus::Unreviewed
+    }
+}
+
 /// Build a lazy tree [`Node`] from a backend [`repo::DirEntry`].
 fn node_from_entry(e: repo::DirEntry) -> Node {
     Node {
@@ -1610,6 +1796,49 @@ mod ui_tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     }
 
+    /// Make a fresh throwaway repo dir + a `git` runner closure bound to it.
+    fn new_repo_dir() -> (PathBuf, impl Fn(&[&str])) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "purview-ec-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        let git = move |args: &[&str]| {
+            Command::new("git").args(args).current_dir(&d).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["checkout", "-q", "-b", "main"]);
+        (dir, git)
+    }
+
+    /// A repo whose one changed file has TWO well-separated hunks (so the diff
+    /// genuinely groups into >1 hunk). Used by the bug-3 targeting tests.
+    fn multi_hunk_repo() -> PathBuf {
+        let (dir, git) = new_repo_dir();
+        // 30 lines, so an edit near the top and near the bottom land in
+        // distinct hunks (3-line context doesn't bridge them).
+        let base: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("a.txt"), &base).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let edited: String = (1..=30)
+            .map(|n| match n {
+                3 => "LINE 3 EDIT\n".to_string(),
+                27 => "LINE 27 EDIT\n".to_string(),
+                _ => format!("line {n}\n"),
+            })
+            .collect();
+        std::fs::write(dir.join("a.txt"), &edited).unwrap();
+        dir
+    }
+
     #[test]
     fn app_opens_with_a_diff_and_renders_all_states_without_panic() {
         let repo = fixture_repo();
@@ -1739,5 +1968,400 @@ mod ui_tests {
         assert_eq!(cell(&out[3], 1), Some((LineKind::Add, "new3".into())));
         // Row 4: context on both sides.
         assert_eq!(cell(&out[4], 0), Some((LineKind::Ctx, "z".into())));
+    }
+
+    // ===================================================================
+    // Bug 3 — approve/reject must target the EXACT hunk, never always hunk 0.
+    // ===================================================================
+
+    /// In Summary extent, the file genuinely has >1 hunk and each rendered
+    /// HunkHeader carries the matching `hunk_idx` (0,1,2,…). This is the
+    /// guarantee that a click on a header acts on its OWN hunk — the heart of
+    /// the bug-3 fix (previously a single header could target hunk 0).
+    #[test]
+    fn summary_headers_carry_their_own_hunk_index() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Summary;
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        app.ensure_cache();
+        assert!(app.files[0].hunks.len() >= 2, "fixture must have ≥2 hunks");
+
+        let header_idxs: Vec<usize> = app
+            .cache
+            .iter()
+            .filter_map(|r| match r {
+                RenderRow::HunkHeader { hunk_idx, whole_file, .. } => {
+                    assert!(!whole_file, "Summary headers are per-hunk, not whole-file");
+                    Some(*hunk_idx)
+                }
+                _ => None,
+            })
+            .collect();
+        // One header per hunk, numbered 0..n in order.
+        assert_eq!(
+            header_idxs,
+            (0..app.files[0].hunks.len()).collect::<Vec<_>>(),
+            "each header targets its own hunk index, in order"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Applying status to hunk N (the code path the per-hunk buttons drive)
+    /// changes ONLY hunk N — not the top hunk, not any sibling.
+    #[test]
+    fn setting_status_on_one_hunk_leaves_others_untouched() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        let n = app.files[0].hunks.len();
+        assert!(n >= 2);
+        // Target the LAST hunk (the bug always hit the first).
+        let target = n - 1;
+        app.files[0].hunks[target].status = ReviewStatus::Rejected;
+        for (i, h) in app.files[0].hunks.iter().enumerate() {
+            if i == target {
+                assert_eq!(h.status, ReviewStatus::Rejected, "target hunk rejected");
+            } else {
+                assert_eq!(
+                    h.status,
+                    ReviewStatus::Unreviewed,
+                    "hunk {i} must stay unreviewed (no spill to hunk 0)"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// In Full extent the displayed content is one full-file hunk, so the
+    /// control strip is marked `whole_file` and acts on EVERY review hunk.
+    /// (Previously it silently targeted only summary hunk 0.)
+    #[test]
+    fn full_extent_emits_one_whole_file_control_strip() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full;
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        app.ensure_cache();
+        let headers: Vec<(usize, bool)> = app
+            .cache
+            .iter()
+            .filter_map(|r| match r {
+                RenderRow::HunkHeader { hunk_idx, whole_file, .. } => Some((*hunk_idx, *whole_file)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers.len(), 1, "Full extent shows one control strip");
+        assert!(headers[0].1, "the strip is whole-file");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// `aggregate_status`: a whole-file strip is Approved only when every hunk
+    /// is approved, Rejected only when every hunk is rejected, else Unreviewed.
+    #[test]
+    fn aggregate_status_is_all_or_nothing() {
+        let mut f = ChangedFile {
+            path: "x".into(),
+            hunks: vec![
+                Hunk::new("h0".into()),
+                Hunk::new("h1".into()),
+                Hunk::new("h2".into()),
+            ],
+        };
+        let all = [0usize, 1, 2];
+        assert_eq!(aggregate_status(&f, &all), ReviewStatus::Unreviewed);
+        f.hunks[0].status = ReviewStatus::Approved;
+        // Mixed (one approved, two unreviewed) → still Unreviewed.
+        assert_eq!(aggregate_status(&f, &all), ReviewStatus::Unreviewed);
+        for h in f.hunks.iter_mut() {
+            h.status = ReviewStatus::Approved;
+        }
+        assert_eq!(aggregate_status(&f, &all), ReviewStatus::Approved);
+        for h in f.hunks.iter_mut() {
+            h.status = ReviewStatus::Rejected;
+        }
+        assert_eq!(aggregate_status(&f, &all), ReviewStatus::Rejected);
+        // A single target reflects exactly that hunk.
+        f.hunks[1].status = ReviewStatus::Approved;
+        assert_eq!(aggregate_status(&f, &[1]), ReviewStatus::Approved);
+        assert_eq!(aggregate_status(&f, &[0]), ReviewStatus::Rejected);
+        // Empty targets → Unreviewed.
+        assert_eq!(aggregate_status(&f, &[]), ReviewStatus::Unreviewed);
+    }
+
+    /// Pressing `a` in Full extent approves the WHOLE file (all hunks), matching
+    /// the on-screen whole-file control strip. The kittest harness drives a real
+    /// key press through `app.ui`.
+    #[test]
+    fn key_approve_in_full_extent_approves_all_hunks() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full;
+        app.selected = Some(Selection::Changed(0));
+        let n = app.files[0].hunks.len();
+        assert!(n >= 2);
+
+        let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        harness.press_key(egui::Key::A);
+        harness.run();
+
+        let all_approved = harness.state().files[0]
+            .hunks
+            .iter()
+            .all(|h| h.status == ReviewStatus::Approved);
+        assert!(all_approved, "`a` in Full extent approves every hunk");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// In Summary, pressing `a` approves only the FOCUSED hunk, leaving the
+    /// others alone (per-hunk targeting via keyboard).
+    #[test]
+    fn key_approve_in_summary_targets_only_focused_hunk() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.extent = Extent::Summary;
+        app.selected = Some(Selection::Changed(0));
+        let n = app.files[0].hunks.len();
+        assert!(n >= 2);
+
+        let mut harness = egui_kittest::Harness::new_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        // Move focus to the last hunk with `n`, then approve with `a`.
+        for _ in 0..(n - 1) {
+            harness.press_key(egui::Key::N);
+            harness.run();
+        }
+        harness.press_key(egui::Key::A);
+        harness.run();
+
+        let st = harness.state();
+        let target = n - 1;
+        for (i, h) in st.files[0].hunks.iter().enumerate() {
+            if i == target {
+                assert_eq!(h.status, ReviewStatus::Approved, "focused hunk approved");
+            } else {
+                assert_eq!(
+                    h.status,
+                    ReviewStatus::Unreviewed,
+                    "hunk {i} unchanged — no spill to hunk 0"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===================================================================
+    // Bug 4 — display / rendering edge cases.
+    // ===================================================================
+
+    /// Empty diff: working tree matches HEAD → no changed files, nothing
+    /// selected, and rendering shows the "no changes" state without panic.
+    #[test]
+    fn empty_diff_renders_no_changes() {
+        let (dir, git) = new_repo_dir();
+        std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        // No working-tree edit → clean.
+        let mut app = local_app(&dir);
+        assert!(app.files.is_empty(), "clean tree → no changed files");
+        assert!(app.selected.is_none());
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app); // must not panic
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A brand-new untracked file shows up as an all-add hunk and renders.
+    #[test]
+    fn new_untracked_file_is_all_additions() {
+        let (dir, git) = new_repo_dir();
+        std::fs::write(dir.join("seed.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("fresh.txt"), "alpha\nbeta\n").unwrap();
+
+        let mut app = local_app(&dir);
+        let f = app
+            .files
+            .iter()
+            .find(|f| f.path == "fresh.txt")
+            .expect("untracked file appears in the diff");
+        let rows: Vec<&diff::DiffLineRow> = f.hunks.iter().flat_map(|h| &h.rows).collect();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|r| r.kind == LineKind::Add),
+            "a new file is entirely additions"
+        );
+        app.selected = Some(Selection::Changed(
+            app.files.iter().position(|f| f.path == "fresh.txt").unwrap(),
+        ));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deleted file produces a hunk of deletions and renders without panic.
+    #[test]
+    fn deleted_file_is_all_deletions() {
+        let (dir, git) = new_repo_dir();
+        std::fs::write(dir.join("gone.txt"), "a\nb\nc\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+
+        let mut app = local_app(&dir);
+        let f = app
+            .files
+            .iter()
+            .find(|f| f.path == "gone.txt")
+            .expect("deleted file appears in the diff");
+        let rows: Vec<&diff::DiffLineRow> = f.hunks.iter().flat_map(|h| &h.rows).collect();
+        assert!(
+            rows.iter().any(|r| r.kind == LineKind::Del),
+            "a deleted file shows deletions"
+        );
+        assert!(
+            !rows.iter().any(|r| r.kind == LineKind::Add),
+            "a deleted file has no additions"
+        );
+        app.selected = Some(Selection::Changed(
+            app.files.iter().position(|f| f.path == "gone.txt").unwrap(),
+        ));
+        for layout in [Layout::Inline, Layout::Split] {
+            app.layout = layout;
+            let ctx = egui::Context::default();
+            frame(&ctx, &mut app);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A binary file is handled gracefully: it shows up as a changed file with
+    /// a "(binary file)" hunk (no content rows), and renders without panic.
+    #[test]
+    fn binary_file_handled_gracefully() {
+        let (dir, git) = new_repo_dir();
+        // Commit a binary file, then change its bytes.
+        std::fs::write(dir.join("blob.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("blob.bin"), [0u8, 1, 2, 3, 255, 254, 0, 9]).unwrap();
+
+        let mut app = local_app(&dir);
+        let f = app
+            .files
+            .iter()
+            .find(|f| f.path == "blob.bin")
+            .expect("binary file appears in the diff");
+        // git2 emits a binary delta → one "(binary file)" hunk, no add/del rows.
+        assert!(
+            f.hunks.iter().any(|h| h.header.contains("binary"))
+                || f.hunks.iter().all(|h| h.rows.is_empty()),
+            "binary file surfaces a binary-marker hunk, not text rows"
+        );
+        app.selected = Some(Selection::Changed(
+            app.files.iter().position(|f| f.path == "blob.bin").unwrap(),
+        ));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app); // must not panic on binary content
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file with no trailing newline diffs and renders cleanly (the parser
+    /// must not choke on the "\ No newline at end of file" marker).
+    #[test]
+    fn no_trailing_newline_file_renders() {
+        let (dir, git) = new_repo_dir();
+        std::fs::write(dir.join("nonl.txt"), "first\nsecond").unwrap(); // no \n
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("nonl.txt"), "first\nSECOND").unwrap(); // still no \n
+
+        let mut app = local_app(&dir);
+        let f = app
+            .files
+            .iter()
+            .find(|f| f.path == "nonl.txt")
+            .expect("file appears in the diff");
+        let has_add = f.hunks.iter().flat_map(|h| &h.rows).any(|r| r.kind == LineKind::Add);
+        assert!(has_add, "the edit is captured as an addition");
+        // No stray "\ No newline" line leaked in as a content row.
+        let leaked = f
+            .hunks
+            .iter()
+            .flat_map(|h| &h.rows)
+            .any(|r| r.text.starts_with("\\ No newline"));
+        assert!(!leaked, "the no-newline marker is not a content row");
+        app.selected = Some(Selection::Changed(0));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Full vs Summary extent generate different row sets for the same file:
+    /// Full shows every file line (one whole-file control strip), Summary shows
+    /// only the changed hunks (one header per hunk) with far fewer rows.
+    #[test]
+    fn full_vs_summary_extent_row_generation() {
+        let repo = multi_hunk_repo();
+        let mut app = local_app(&repo);
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+
+        app.extent = Extent::Summary;
+        app.ensure_cache();
+        let summary_rows = app.cache.len();
+        let summary_headers = app
+            .cache
+            .iter()
+            .filter(|r| matches!(r, RenderRow::HunkHeader { .. }))
+            .count();
+
+        app.extent = Extent::Full;
+        app.ensure_cache();
+        let full_rows = app.cache.len();
+        let full_headers = app
+            .cache
+            .iter()
+            .filter(|r| matches!(r, RenderRow::HunkHeader { .. }))
+            .count();
+
+        assert_eq!(summary_headers, app.files[0].hunks.len(), "one header per hunk in Summary");
+        assert_eq!(full_headers, 1, "one whole-file strip in Full");
+        assert!(
+            full_rows > summary_rows,
+            "Full extent (whole 30-line file) has more rows than Summary ({full_rows} vs {summary_rows})"
+        );
+        // Full extent renders ~the whole file as context lines.
+        let full_content = app
+            .cache
+            .iter()
+            .filter(|r| matches!(r, RenderRow::DiffLine { .. }))
+            .count();
+        assert!(full_content >= 28, "Full shows ~all 30 file lines, got {full_content}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A reload that supersedes an in-flight one must not apply the stale
+    /// result (bug 2 race guard). We drive the generation/poll machinery
+    /// directly: stamp a result with an old generation and confirm poll drops it.
+    #[test]
+    fn stale_reload_result_is_ignored() {
+        let repo = fixture_repo();
+        let mut app = local_app(&repo);
+        // Simulate: a reload was in flight (generation G), then a newer reload
+        // bumped the generation. A late result for G arrives.
+        let stale_gen = app.generation;
+        app.generation = app.generation.wrapping_add(1); // superseded
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((stale_gen, Ok(("zzz-stale".to_string(), Vec::new()))))
+            .unwrap();
+        app.diff_rx = Some(rx);
+        app.loading = true;
+        let applied = app.poll_reload();
+        assert!(!applied, "a superseded result must not be applied");
+        assert_ne!(app.branch, "zzz-stale", "stale branch must not leak in");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

@@ -269,7 +269,12 @@ impl SshRepo {
     /// git2 calls produce (working-tree-vs-HEAD, or base...HEAD three-dot).
     fn diff_args(source: DiffSource, base: &str, context: u32, path: Option<&str>) -> Vec<String> {
         let mut v: Vec<String> = vec!["diff".into()];
-        // Match git2: full index, no color, the requested context.
+        // Match git2: full index, no color, the requested context. The "Full
+        // extent" view passes u32::MAX, but the git CLI's `-U` overflows on a
+        // value that large and silently produces a broken, near-zero-context
+        // diff. git2 (the local backend) clamps internally; the CLI does not,
+        // so clamp here to a value larger than any real file.
+        let context = context.min(1_000_000_000);
         v.push(format!("--unified={context}"));
         match source {
             DiffSource::WorkingTree => {
@@ -650,5 +655,101 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    // --- Bug 1: full-file view over SSH ---------------------------------
+    // The "Full extent" view asks for u32::MAX context. The git CLI's
+    // `--unified=` overflows on a value that large and silently returns a
+    // broken, near-zero-context diff (so the full file never shows). git2
+    // (the local backend) clamps internally; the CLI does not, so diff_args
+    // clamps to a value larger than any real file. These tests lock that in.
+
+    /// The emitted `--unified` value must be clamped — never u32::MAX (which
+    /// the remote git CLI mishandles) — yet still large enough to span any
+    /// real file. This is the regression guard for the SSH full-file bug.
+    #[test]
+    fn diff_args_clamps_full_context_below_u32_max() {
+        let args =
+            SshRepo::diff_args(DiffSource::WorkingTree, "main", u32::MAX, None);
+        let unified = args
+            .iter()
+            .find(|a| a.starts_with("--unified="))
+            .expect("a --unified arg is emitted");
+        let n: u64 = unified
+            .strip_prefix("--unified=")
+            .unwrap()
+            .parse()
+            .expect("--unified value is numeric");
+        assert!(
+            n < u32::MAX as u64,
+            "context must be clamped below u32::MAX, got {n}"
+        );
+        // Still huge, so it really does span any real file.
+        assert!(n >= 1_000_000, "clamped value must still be large, got {n}");
+        assert_eq!(unified, "--unified=1000000000");
+    }
+
+    /// A normal (small) context value passes through untouched.
+    #[test]
+    fn diff_args_small_context_passes_through() {
+        let args = SshRepo::diff_args(DiffSource::WorkingTree, "main", 3, None);
+        assert!(args.contains(&"--unified=3".to_string()));
+    }
+
+    /// WorkingTree vs BranchRange produce the right rev arguments, and a
+    /// pathspec is appended after `--`.
+    #[test]
+    fn diff_args_source_and_pathspec() {
+        let wt = SshRepo::diff_args(DiffSource::WorkingTree, "main", 3, None);
+        assert!(wt.contains(&"HEAD".to_string()));
+        assert!(!wt.iter().any(|a| a.contains("...")));
+
+        let br = SshRepo::diff_args(DiffSource::BranchRange, "main", 3, None);
+        assert!(br.contains(&"main...HEAD".to_string()));
+
+        let with_path =
+            SshRepo::diff_args(DiffSource::WorkingTree, "main", 3, Some("src/a.rs"));
+        let dd = with_path.iter().position(|a| a == "--").unwrap();
+        assert_eq!(with_path[dd + 1], "src/a.rs");
+    }
+
+    /// A full-context patch (every line emitted as context, with a couple of
+    /// real edits) must parse so that EVERY line of the file is represented —
+    /// this is the parser side of the full-file-view fix. Mirrors the patch
+    /// shape `git diff --unified=<huge>` produces.
+    #[test]
+    fn parse_unified_patch_full_context_keeps_all_lines() {
+        // 6-line file; line 3 changed from "three" to "THREE".
+        let patch = "\
+diff --git a/f.txt b/f.txt
+index 1111111..2222222 100644
+--- a/f.txt
++++ b/f.txt
+@@ -1,6 +1,6 @@
+ one
+ two
+-three
++THREE
+ four
+ five
+ six
+";
+        let files = crate::diff::parse_unified_patch(patch);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "f.txt");
+        let rows = &files[0].hunks[0].rows;
+        // All 6 source lines are present (5 context + 1 add; the deletion of
+        // "three" is also a row). Reconstruct the NEW-side file from the rows.
+        use crate::diff::LineKind;
+        let new_side: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind != LineKind::Del)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(new_side, ["one", "two", "THREE", "four", "five", "six"]);
+        // And the removed line is represented as a deletion row.
+        assert!(rows
+            .iter()
+            .any(|r| r.kind == LineKind::Del && r.text == "three"));
     }
 }
