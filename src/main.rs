@@ -253,9 +253,119 @@ fn fetch_content(repo: &dyn RepoSource, key: &ContentKey) -> Result<FileContent,
     }
 }
 
+/// A single review-state persist job: the serialized JSON plus the
+/// per-comparison filename it also lands under. `save_review_state` builds one
+/// of these and hands it to the background writer; the canonical
+/// `review-state.json` mirror is always written too.
+struct SaveJob {
+    relname: String,
+    json: String,
+}
+
+/// Off-UI-thread persistence of review state (bug 1).
+///
+/// Approve/reject/clear/comment-close must flip the in-memory status INSTANTLY
+/// (the ✓ shows the same frame), but the actual serialize + `persist_state`
+/// write is slow over SSH (a blocking remote round-trip, ~1s). So the UI never
+/// calls `persist_state` directly — it sends a [`SaveJob`] down this channel to
+/// a dedicated worker thread that owns an `Arc` clone of the repo.
+///
+/// Rapid writes coalesce: the worker drains every queued job and persists only
+/// the LATEST (review state is whole-snapshot, so an older snapshot is always
+/// fully superseded by a newer one). Correctness holds — the last state the
+/// user produced is the one that ends up on disk/remote.
+/// One message to the writer thread: either a snapshot to persist, or a flush
+/// request (an ack channel the worker signals once the queue is drained).
+enum WriteMsg {
+    Save(SaveJob),
+    /// Used only to make persistence observable in tests / on shutdown: the
+    /// worker replies once it has caught up past this point.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+struct StateWriter {
+    tx: std::sync::mpsc::Sender<WriteMsg>,
+    /// Kept so the worker thread is joined on drop (flushing the final write)
+    /// rather than abandoned. `Option` so `Drop` can `take()` it.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StateWriter {
+    /// Spawn the writer thread bound to `repo`. The thread blocks on the
+    /// channel, coalesces bursts, and exits when the sender is dropped.
+    fn spawn(repo: std::sync::Arc<dyn RepoSource>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<WriteMsg>();
+        let handle = std::thread::spawn(move || {
+            // Block for the next message; once a Save arrives, drain any others
+            // queued behind it and keep only the most recent (coalescing). A
+            // full review-state snapshot fully supersedes earlier ones. A Flush
+            // is answered after the latest pending Save has been written.
+            while let Ok(msg) = rx.recv() {
+                let mut latest: Option<SaveJob> = None;
+                let mut acks: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+                let handle_msg = |m: WriteMsg, latest: &mut Option<SaveJob>, acks: &mut Vec<_>| match m {
+                    WriteMsg::Save(job) => *latest = Some(job),
+                    WriteMsg::Flush(ack) => acks.push(ack),
+                };
+                handle_msg(msg, &mut latest, &mut acks);
+                while let Ok(next) = rx.try_recv() {
+                    handle_msg(next, &mut latest, &mut acks);
+                }
+                if let Some(job) = latest {
+                    // Per-comparison file (source of truth) + canonical mirror
+                    // the MCP server reads. Both write WHERE the repo lives
+                    // (SSH→remote + local mirror, or local fs) — identical to the
+                    // old sync path, just off the UI thread.
+                    let _ = repo.persist_state(&job.relname, &job.json);
+                    let _ = repo.persist_state("review-state.json", &job.json);
+                }
+                // Ack any flush requests now that the latest write is done.
+                for ack in acks {
+                    let _ = ack.send(());
+                }
+            }
+        });
+        StateWriter { tx, handle: Some(handle) }
+    }
+
+    /// Queue a snapshot for background persistence. Never blocks on I/O.
+    fn save(&self, job: SaveJob) {
+        let _ = self.tx.send(WriteMsg::Save(job));
+    }
+
+    /// Block until every queued write has been flushed to the backend. Only
+    /// used in tests and on shutdown; the UI never calls this on a keypress.
+    fn flush(&self) {
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if self.tx.send(WriteMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
+}
+
+impl Drop for StateWriter {
+    fn drop(&mut self) {
+        // Dropping the sender closes the channel; the worker drains its queue,
+        // performs the final write, then exits. Joining ensures that last write
+        // completes before the process tears down (don't lose the latest state).
+        if let Some(handle) = self.handle.take() {
+            // The worker blocks on `recv` until ALL senders are dropped. Replace
+            // the live sender with a fresh, immediately-dropped one so the
+            // original closes here (before join) instead of blocking forever.
+            let (dead_tx, _dead_rx) = std::sync::mpsc::channel();
+            let _ = std::mem::replace(&mut self.tx, dead_tx);
+            let _ = handle.join();
+        }
+    }
+}
+
 struct App {
     /// Repo backend — local (git2 + fs) or SSH. The UI only talks to this.
     repo: std::sync::Arc<dyn RepoSource>,
+    /// Background persister for review state (bug 1): the UI flips status in
+    /// memory immediately, then queues the serialize+write here so a slow SSH
+    /// round-trip never blocks the keypress.
+    state_writer: StateWriter,
     branch: String,
     base: String,
     base_input: String,
@@ -334,6 +444,11 @@ struct App {
     /// the `Align` is where to land it (Center for matches/hunks, Min for the
     /// file-switch "first hunk to the top"). Consumed (taken) once applied.
     scroll_to_row: Option<(usize, egui::Align)>,
+    /// Set by j/k when the changed-files selection moves: scroll the left
+    /// changed-files lane so the newly-selected row stays visible (bug 3). Only
+    /// set when the selection actually changes, so manual scrolling of the lane
+    /// isn't yanked back every frame. Consumed by the lane's render.
+    scroll_changed_files: bool,
     /// Set by j/k when switching to a different changed file: scroll so that
     /// file's FIRST hunk header is at the top. Resolved AFTER `ensure_cache`
     /// rebuilds `hunk_rows` for the new file (the header row isn't known at
@@ -375,9 +490,17 @@ struct App {
     show_help: bool,
     /// In-file (Ctrl+F) search state. Some = the search bar is open.
     search: Option<Search>,
-    /// The open file's path as of last frame, so the tree only auto-scrolls to
+    /// The open file's path as of last frame, so the tree only STARTS revealing
     /// the highlighted row when the open file actually changes (not every frame).
     last_open_path: Option<String>,
+    /// A pending "reveal this file in the tree" request (bug 4): set when the
+    /// open file changes, held across frames until the file's row is actually
+    /// rendered and scrolled to. While set, `render_tree` force-expands the
+    /// file's ancestor dirs (a collapsed parent otherwise hides the row, leaving
+    /// nothing to scroll to) and requests the scroll. Collapse animation means
+    /// the row may not paint the same frame the dirs open, so the request is
+    /// sticky and clears only once the row is reached. `None` = nothing pending.
+    tree_reveal: Option<String>,
     /// The file open when a reload/refresh started, so the fresh diff can
     /// re-select it instead of snapping back to the first changed file.
     reopen_after_reload: Option<String>,
@@ -390,14 +513,22 @@ struct App {
     /// which under-estimates with variable-height rows and stops paging short
     /// of the real end of a long file.
     content_height: f32,
-    /// The cache-row range egui ACTUALLY painted in the content area last frame
-    /// (from `show_rows`' `range`), as an inclusive `[first, last]`. This is the
-    /// real visible window — it accounts for variable row heights, unlike the
-    /// old `content_scroll / row_h .. + viewport / row_h` estimate, which
-    /// drifted past any tall HunkHeader rows above the viewport. n/p reads this
-    /// to decide whether the target hunk is already on screen. `None` until the
-    /// first content frame paints.
+    /// The cache-row range ACTUALLY ON SCREEN in the content area last frame, as
+    /// an inclusive `[first, last]`. Built by testing each rendered row's REAL
+    /// rect against the viewport clip rect (bug 2) — NOT from `show_rows`' painted
+    /// `range`, which assumes a uniform `row_h` and so pads its window past the
+    /// fold whenever tall HunkHeader strips are in play (reporting a hunk just
+    /// below the bottom as "visible", which made n/p skip the scroll). n/p reads
+    /// this to decide whether the target hunk is already on screen. `None` until
+    /// the first content frame paints.
     visible_rows: Option<(usize, usize)>,
+    /// TEST-ONLY: the range `show_rows` actually painted last frame (its
+    /// uniform-`row_h` window). With tall HunkHeader rows this OVER-reaches the
+    /// truly-visible window, which is the bug-2 root cause; `visible_rows` (the
+    /// accurate, real-rect range) is a subset of it. Kept only to assert that
+    /// relationship in tests — the live code never reads it.
+    #[cfg(test)]
+    painted_naive: Option<(usize, usize)>,
     /// Saved reviewed hunks whose content-anchor no longer appears in the
     /// current diff (the changed code was removed/reverted). Carried across
     /// reloads so the reviewer's notes aren't silently dropped; surfaced in the
@@ -418,8 +549,13 @@ impl App {
             .into_iter()
             .map(node_from_entry)
             .collect();
+        // Background review-state persister (bug 1): holds its own Arc clone of
+        // the backend so the serialize+write (a blocking SSH round-trip) runs
+        // off the UI thread. Spawn before moving `repo` into the struct.
+        let state_writer = StateWriter::spawn(repo.clone());
         let mut app = App {
             repo,
+            state_writer,
             branch: String::new(),
             base: String::new(),
             base_input: String::new(),
@@ -453,6 +589,7 @@ impl App {
             ui_scale: 1.0,
             pending_scroll: None,
             scroll_to_row: None,
+            scroll_changed_files: false,
             scroll_to_first_hunk: false,
             editing: None,
             diff_rx: None,
@@ -467,11 +604,14 @@ impl App {
             show_help: false,
             search: None,
             last_open_path: None,
+            tree_reveal: None,
             reopen_after_reload: None,
             content_scroll: 0.0,
             content_viewport_h: 0.0,
             content_height: 0.0,
             visible_rows: None,
+            #[cfg(test)]
+            painted_naive: None,
             orphaned: Vec::new(),
         };
         // Guess a sensible default base for branch-range mode.
@@ -597,6 +737,10 @@ impl App {
                 // Re-anchor saved state for the current comparison onto the
                 // fresh diff. Loads the per-comparison file (migrating the old
                 // single-file layout if needed); None = a fresh review.
+                // Persistence is async (bug 1), so flush any in-flight write
+                // first — otherwise the re-anchor could read a stale snapshot
+                // and drop the latest verdicts.
+                self.state_writer.flush();
                 let key = self.comparison_key();
                 if let Some(saved) =
                     ReviewState::load_for_comparison(&self.state_root, &key)
@@ -812,13 +956,16 @@ impl App {
             orphaned: self.orphaned.clone(),
         };
         // Persist WHERE the repo lives (remote over SSH, local fs otherwise) so
-        // the MCP server reads it natively. Serialize once, write to both the
-        // per-comparison file and the canonical mirror.
+        // the MCP server reads it natively. Serialize once HERE (cheap, on the
+        // UI thread — the snapshot reflects this frame), then hand the actual
+        // write to the background `StateWriter` (bug 1). The status flip the
+        // caller just made is already in `self.files`, so the UI shows it this
+        // frame; the slow SSH round-trip happens off-thread and never blocks
+        // input. The worker coalesces bursts and persists the latest snapshot.
         if let Ok(json) = state.to_json() {
             let key = self.comparison_key();
             let relname = format!("state/{}.json", key.file_stem());
-            let _ = self.repo.persist_state(&relname, &json);
-            let _ = self.repo.persist_state("review-state.json", &json);
+            self.state_writer.save(SaveJob { relname, json });
         }
     }
 
@@ -1630,6 +1777,10 @@ impl App {
                 // first change may not sit at row 0).
                 self.focus_hunk = 0;
                 self.scroll_to_first_hunk = true;
+                // Keep the selected row visible in the left changed-files lane
+                // (bug 3) — only on an actual selection change, so manual
+                // scrolling of the lane isn't fought every frame.
+                self.scroll_changed_files = true;
             }
             self.selected = Some(Selection::Changed(next));
         }
@@ -1984,6 +2135,9 @@ impl App {
                     ui.colored_label(Color32::LIGHT_RED, err);
                 }
                 let changed_h = (ui.available_height() * 0.45).max(80.0);
+                // j/k moved the selection: scroll this lane to keep it visible
+                // (bug 3). Taken so it fires once per change, not every frame.
+                let scroll_changed = std::mem::take(&mut self.scroll_changed_files);
                 egui::ScrollArea::vertical()
                     .id_salt("changed")
                     .max_height(changed_h)
@@ -1999,8 +2153,13 @@ impl App {
                                 "○"
                             };
                             let label = format!("{glyph} {}", self.files[i].path);
-                            if ui.selectable_label(selected, label).clicked() {
+                            let resp = ui.selectable_label(selected, label);
+                            if resp.clicked() {
                                 self.selected = Some(Selection::Changed(i));
+                            }
+                            // Keep the j/k-selected row on screen.
+                            if selected && scroll_changed {
+                                resp.scroll_to_me(Some(egui::Align::Center));
                             }
                         }
                     });
@@ -2011,9 +2170,17 @@ impl App {
                 // it full-file, changed or not.
                 ui.label(egui::RichText::new("Files").strong());
                 let open = self.open_path();
-                // Auto-scroll the tree to the open file only when it changes,
-                // so manual scrolling isn't yanked back every frame.
-                let scroll_to_open = open != self.last_open_path;
+                // When the open file changes, START revealing it: expand its
+                // ancestor dirs + scroll to it (bug 4). The request is sticky
+                // (held in `tree_reveal`) so manual scrolling isn't yanked back
+                // every frame, yet a row hidden behind a collapse animation still
+                // gets reached over the next frame(s).
+                if open != self.last_open_path {
+                    self.tree_reveal = open.clone();
+                }
+                self.last_open_path = open.clone();
+                let reveal = self.tree_reveal.clone();
+                let mut revealed = false;
                 egui::ScrollArea::vertical()
                     .id_salt("tree")
                     .auto_shrink([false, false])
@@ -2024,14 +2191,20 @@ impl App {
                             self.repo.as_ref(),
                             &mut self.tree_nodes,
                             open.as_deref(),
-                            scroll_to_open,
+                            reveal.as_deref(),
                             &mut clicked,
+                            &mut revealed,
                         );
                         if let Some(rel) = clicked {
                             self.selected = Some(Selection::Path(rel));
                         }
                     });
-                self.last_open_path = open;
+                // Clear the pending reveal once the file's row was actually
+                // rendered + scrolled to (it may have taken a frame for the
+                // ancestor dirs to finish expanding).
+                if revealed {
+                    self.tree_reveal = None;
+                }
             });
 
         self.ensure_cache();
@@ -2278,14 +2451,29 @@ impl App {
                 // matter (it's corrected the same frame against actual geometry).
                 area = area.vertical_scroll_offset((target as f32 * row_h).max(0.0));
             }
+            // Accurate visible-row range, built from each row's REAL on-screen
+            // rect this frame (bug 2). `show_rows`' `range` over-counts when
+            // rows vary in height — it assumes a uniform `row_h`, so it pads the
+            // painted window and reports rows that are actually scrolled just
+            // past the fold as "visible", which made n/p skip the scroll. We
+            // instead test each row's true rect against the viewport clip rect.
             let mut painted: Option<(usize, usize)> = None;
+            #[cfg(test)]
+            let mut naive_painted: Option<(usize, usize)> = None;
             let out = area.show_rows(
                 ui,
                 row_h,
                 total,
                 |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    painted = Some((range.start, range.end.saturating_sub(1)));
+                    // The viewport in screen coords (what's actually on screen).
+                    let viewport = ui.clip_rect();
+                    // TEST-ONLY: capture show_rows' uniform-row_h window so a test
+                    // can prove the accurate range is a (sometimes strict) subset.
+                    #[cfg(test)]
+                    if range.end > range.start {
+                        naive_painted = Some((range.start, range.end - 1));
+                    }
                     let focus_row = self.hunk_rows.get(self.focus_hunk).copied();
                     for i in range {
                         // Ctrl+F highlight: tint matched rows; the current match
@@ -2406,6 +2594,20 @@ impl App {
                             egui::pos2(ui.max_rect().min.x, y_before),
                             egui::vec2(ui.max_rect().width(), (y_after - y_before).max(row_h)),
                         );
+                        // Accurate visibility (bug 2): a row is visible only if
+                        // its real rect actually overlaps the viewport. This
+                        // EXCLUDES rows `show_rows` painted-but-clipped (the ones
+                        // its uniform-`row_h` window over-reaches into), so a
+                        // hunk scrolled just past the fold is correctly off-screen
+                        // and n/p will scroll to it instead of skipping.
+                        if row_rect.bottom() > viewport.top()
+                            && row_rect.top() < viewport.bottom()
+                        {
+                            painted = Some(match painted {
+                                Some((lo, hi)) => (lo.min(i), hi.max(i)),
+                                None => (i, i),
+                            });
+                        }
                         // Overlay the search tint across the row just drawn.
                         if let Some(tint) = search_tint {
                             ui.painter().rect_filled(row_rect, 0.0, tint);
@@ -2429,6 +2631,10 @@ impl App {
             self.content_height = out.content_size.y;
             if let Some(pr) = painted {
                 self.visible_rows = Some(pr);
+            }
+            #[cfg(test)]
+            {
+                self.painted_naive = naive_painted;
             }
         });
 
@@ -2560,7 +2766,9 @@ impl App {
                     // stacking (the Full+Split "all on one line" regression).
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        painted = Some((range.start, range.end.saturating_sub(1)));
+                        // Viewport in screen coords for the accurate visibility
+                        // test (bug 2) — see the unified path for the rationale.
+                        let viewport = ui.clip_rect();
                         for i in range {
                             let y_before = ui.cursor().min.y;
                             match &self.cache[i] {
@@ -2597,20 +2805,28 @@ impl App {
                                     ui.label(" ");
                                 }
                             }
-                            // Accurate scroll-to-row off the left pane's real
-                            // row rect (variable heights → no drift). The
-                            // resulting offset is captured into the shared
-                            // offset below so the right pane follows in lockstep.
+                            // The left pane's real row rect (variable heights).
+                            let y_after = ui.cursor().min.y;
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(ui.max_rect().min.x, y_before),
+                                egui::vec2(
+                                    ui.max_rect().width(),
+                                    (y_after - y_before).max(row_h),
+                                ),
+                            );
+                            // Accurate visibility from the real rect (bug 2),
+                            // excluding `show_rows`' over-reached clipped rows.
+                            if rect.bottom() > viewport.top() && rect.top() < viewport.bottom() {
+                                painted = Some(match painted {
+                                    Some((lo, hi)) => (lo.min(i), hi.max(i)),
+                                    None => (i, i),
+                                });
+                            }
+                            // Accurate scroll-to-row off the row's real rect (no
+                            // drift). The resulting offset is captured below so
+                            // the right pane follows in lockstep.
                             if let Some((target, align)) = scroll_to_row {
                                 if i == target {
-                                    let y_after = ui.cursor().min.y;
-                                    let rect = egui::Rect::from_min_size(
-                                        egui::pos2(ui.max_rect().min.x, y_before),
-                                        egui::vec2(
-                                            ui.max_rect().width(),
-                                            (y_after - y_before).max(row_h),
-                                        ),
-                                    );
                                     ui.scroll_to_rect(rect, Some(align));
                                 }
                             }
@@ -3180,13 +3396,40 @@ fn render_tree(
     repo: &dyn RepoSource,
     nodes: &mut [Node],
     open: Option<&str>,
-    scroll_to_open: bool,
+    reveal: Option<&str>,
     clicked: &mut Option<String>,
+    revealed: &mut bool,
 ) {
     for node in nodes.iter_mut() {
         if node.is_dir {
             let id = ui.make_persistent_id(&node.rel);
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+            // Bug 4: when a reveal is pending, auto-EXPAND every ancestor dir of
+            // the target file — otherwise a collapsed parent hides the file row
+            // and there's nothing to scroll to. Force this dir's CollapsingState
+            // open AND eagerly load its children (the lazy `.body` load only
+            // fires for dirs egui already renders expanded, which a programmatic
+            // open wouldn't otherwise trigger this frame).
+            let is_ancestor =
+                reveal.is_some_and(|r| is_ancestor_dir(&node.rel, r));
+            let mut state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    false,
+                );
+            if is_ancestor {
+                state.set_open(true);
+                if node.children.is_none() {
+                    node.children = Some(
+                        repo.list_dir(&node.rel)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(node_from_entry)
+                            .collect(),
+                    );
+                }
+            }
+            state
                 .show_header(ui, |ui| {
                     ui.label(format!("📁 {}", node.name));
                 })
@@ -3202,20 +3445,34 @@ fn render_tree(
                         );
                     }
                     if let Some(children) = node.children.as_mut() {
-                        render_tree(ui, repo, children, open, scroll_to_open, clicked);
+                        render_tree(ui, repo, children, open, reveal, clicked, revealed);
                     }
                 });
         } else {
             let is_open = open == Some(node.rel.as_str());
             let resp = ui.selectable_label(is_open, &node.name);
-            if is_open && scroll_to_open {
+            // Scroll to (and finish revealing) the target file's row.
+            if reveal == Some(node.rel.as_str()) {
                 resp.scroll_to_me(Some(egui::Align::Center));
+                *revealed = true;
             }
             if resp.clicked() {
                 *clicked = Some(node.rel.clone());
             }
         }
     }
+}
+
+/// Is forward-slashed directory `dir` an ancestor of (or equal in prefix to)
+/// the file path `file`? `dir` must match a whole path segment — `src` is an
+/// ancestor of `src/main.rs` but `sr` is not, and `src` is not its own file.
+/// Empty `dir` (repo root) is an ancestor of everything.
+fn is_ancestor_dir(dir: &str, file: &str) -> bool {
+    if dir.is_empty() {
+        return true;
+    }
+    file.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -3337,6 +3594,9 @@ mod ui_tests {
         let mut app = local_app(&repo);
         app.files[0].hunks[0].status = ReviewStatus::Approved;
         app.save_review_state();
+        // Persistence is async (bug 1); wait for the background writer to land
+        // the file before asserting it's on disk.
+        app.state_writer.flush();
 
         let state = ReviewState::load(&repo).expect("review-state.json written");
         assert!(
@@ -3369,6 +3629,8 @@ mod ui_tests {
             .any(|h| h.status == ReviewStatus::Approved);
         assert!(approved, "clicking approve should set a hunk Approved");
 
+        // Persistence is async (bug 1) — flush the background writer first.
+        harness.state().state_writer.flush();
         let state = ReviewState::load(&repo).expect("review-state.json written");
         assert!(
             state.files.iter().flat_map(|f| &f.hunks).any(|h| h.status == "approved"),
@@ -3846,6 +4108,7 @@ mod ui_tests {
              proving a real button was drawn and hit, not just a label"
         );
 
+        harness.state().state_writer.flush();
         let state = ReviewState::load(&repo).expect("review-state.json written");
         assert!(
             state.files.iter().flat_map(|f| &f.hunks).any(|h| h.status == "approved"),
@@ -4532,6 +4795,83 @@ mod ui_tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// REGRESSION (bug 2): the visibility test must reflect the REAL on-screen
+    /// rects, not `show_rows`' uniform-`row_h` painted range. In Full extent the
+    /// tall HunkHeader strips make `show_rows` over-reach its window past the
+    /// fold: it pads the painted window by ~`row_h` per row, so the rows just
+    /// below the bottom edge are still in its `range`. The old `range`-based
+    /// visibility test therefore reported those just-below-fold rows as
+    /// "visible", and n/p skipped the scroll for a hunk sitting there. We assert:
+    /// (a) the accurate `visible_rows` is a SUBSET of `show_rows`' painted range
+    ///     (never larger), and
+    /// (b) the painted range genuinely OVER-reaches the accurate fold here, so
+    ///     there is at least one row (`abot+1`) the OLD test would call visible
+    ///     but the new one correctly excludes — the exact root-cause band, and
+    /// (c) a hunk below the accurate fold still gets scrolled to by `n`.
+    #[test]
+    fn visible_rows_excludes_rows_below_the_fold() {
+        let repo = multi_hunk_repo(); // 30-line file, 2 hunks (rows ~top, ~27)
+        let mut app = local_app(&repo);
+        app.extent = Extent::Full; // whole file + tall per-hunk strips
+        app.layout = Layout::Inline;
+        app.selected = Some(Selection::Changed(0));
+        assert!(app.files[0].hunks.len() >= 2, "need ≥2 hunks");
+
+        // A short window so the file overflows and rows fall below the fold.
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 200.0))
+            .build_state(|ctx, app: &mut App| app.ui(ctx), app);
+        harness.run();
+        harness.run(); // let painted ranges settle
+
+        let st = harness.state();
+        let (atop, abot) = st.visible_rows.expect("accurate range painted");
+        let (ntop, nbot) = st.painted_naive.expect("show_rows range painted");
+        // (a) Accurate ⊆ naive: every on-screen row is one show_rows painted,
+        //     and the accurate range never extends past it.
+        assert!(
+            atop >= ntop && abot <= nbot,
+            "accurate visible [{atop},{abot}] must be inside show_rows' painted \
+             [{ntop},{nbot}]"
+        );
+        // (b) The painted range over-reaches the real fold: with the tall
+        //     HunkHeader at row 0, show_rows pads its window past where content
+        //     actually ends on screen. So `abot < nbot` — and the row just below
+        //     the accurate fold is in the OLD (range) test's window yet NOT in
+        //     the accurate one. That row is precisely a "just below the fold"
+        //     row the old code wrongly treated as visible.
+        assert!(
+            abot < nbot,
+            "show_rows' padded range [{ntop},{nbot}] should extend past the \
+             accurate fold [{atop},{abot}] — the over-count band that hid the bug"
+        );
+        let just_below = abot + 1;
+        assert!(
+            row_in_viewport(just_below, ntop, nbot)
+                && !row_in_viewport(just_below, atop, abot),
+            "row {just_below} (just below the fold) must be claimed visible by the \
+             OLD range test [{ntop},{nbot}] but correctly excluded by the new \
+             accurate test [{atop},{abot}]"
+        );
+
+        // (c) A hunk below the accurate fold must still be scrolled to by `n`.
+        let second_hunk_row = st.hunk_rows[1];
+        assert!(
+            !row_in_viewport(second_hunk_row, atop, abot),
+            "hunk 2 (row {second_hunk_row}) is below the accurate fold [{atop},{abot}]"
+        );
+        let before = st.content_scroll;
+        harness.press_key(egui::Key::N);
+        harness.run();
+        harness.run();
+        let after = harness.state().content_scroll;
+        assert!(
+            after > before,
+            "n must scroll to the off-screen hunk (before {before}, after {after})"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// END-TO-END (kittest): Ctrl+F jump centers the matched row in the viewport.
     /// With tall HunkHeader strips above, the old `row * row_h` scroll landed the
     /// match "below the page"; the scroll_to_rect-on-actual-rect jump must put
@@ -4576,6 +4916,88 @@ mod ui_tests {
              after the search jump (not drifted below the page)"
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A RepoSource that records every `persist_state` write (relname → latest
+    /// contents) and counts total writes, so a test can observe what the
+    /// background `StateWriter` actually persisted. Each `persist_state` sleeps
+    /// briefly to model a slow SSH round-trip (so coalescing has something to
+    /// coalesce).
+    struct RecordingRepo {
+        root: PathBuf,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+    impl purview::repo::RepoSource for RecordingRepo {
+        fn compute_diff(&self, _s: DiffSource, _b: &str) -> Result<(String, Vec<ChangedFile>), String> {
+            Ok(("main".into(), Vec::new()))
+        }
+        fn compute_file_diff(&self, _s: DiffSource, _b: &str, _c: u32, _p: &str) -> Result<(String, Vec<ChangedFile>), String> {
+            Ok(("main".into(), Vec::new()))
+        }
+        fn read_file(&self, _r: &str) -> Result<String, String> { Ok(String::new()) }
+        fn list_dir(&self, _r: &str) -> Result<Vec<purview::repo::DirEntry>, String> { Ok(Vec::new()) }
+        fn list_all_files(&self, _c: usize) -> (Vec<String>, bool) { (Vec::new(), false) }
+        fn guess_default_base(&self) -> String { "main".into() }
+        fn write_line(&self, _r: &str, _l: usize, _t: &str) -> Result<(), String> { Ok(()) }
+        fn grep_symbol(&self, _s: &str) -> Result<Vec<purview::gotodef::Candidate>, String> { Ok(Vec::new()) }
+        fn label(&self) -> String { "recording".into() }
+        fn state_root(&self) -> &std::path::Path { &self.root }
+        fn persist_state(&self, relname: &str, contents: &str) -> Result<(), String> {
+            // Model a slow remote write so rapid saves queue up behind it.
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            self.writes.lock().unwrap().push((relname.to_string(), contents.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Bug 1: review-state persistence is async and durable. Queuing several
+    /// snapshots in a burst must (a) NOT block the caller on the slow writes,
+    /// and (b) after `flush`, the LATEST snapshot is what got persisted — to
+    /// BOTH the per-comparison file and the canonical `review-state.json`
+    /// mirror. Coalescing means we don't require every intermediate snapshot to
+    /// hit disk, only that the final state is correct and complete.
+    #[test]
+    fn state_writer_persists_latest_snapshot_async() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let repo: std::sync::Arc<dyn purview::repo::RepoSource> =
+            std::sync::Arc::new(RecordingRepo { root: std::env::temp_dir(), writes: writes.clone() });
+        let writer = StateWriter::spawn(repo);
+
+        // Fire a burst of snapshots; the slow (15ms) writes guarantee later ones
+        // queue behind the first, exercising the coalescing path.
+        let t0 = std::time::Instant::now();
+        for v in ["s0", "s1", "s2", "final"] {
+            writer.save(SaveJob {
+                relname: "state/cur.json".into(),
+                json: v.to_string(),
+            });
+        }
+        // The save() calls themselves must be effectively instant (no blocking
+        // on the 15ms-per-write backend) — they just enqueue.
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(15),
+            "save() must not block on the slow backend write (took {:?})",
+            t0.elapsed()
+        );
+
+        writer.flush();
+        let w = writes.lock().unwrap();
+        // The final snapshot must be the last thing persisted, to both targets.
+        assert!(
+            w.iter().any(|(r, c)| r == "state/cur.json" && c == "final"),
+            "the latest snapshot must reach the per-comparison file, got {w:?}"
+        );
+        assert!(
+            w.iter().any(|(r, c)| r == "review-state.json" && c == "final"),
+            "the latest snapshot must reach the canonical MCP mirror, got {w:?}"
+        );
+        // Coalescing: a same-burst snapshot count should NOT require all four
+        // intermediates to hit disk (else there's no coalescing). We persisted
+        // 2 files per surviving job, so far fewer than 4×2 writes.
+        assert!(
+            w.len() < 8,
+            "rapid saves should coalesce, not write every intermediate (writes: {w:?})"
+        );
     }
 
     // ===================================================================
@@ -4657,6 +5079,79 @@ mod ui_tests {
         app.selected = None;
         assert_eq!(app.open_path(), None);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// `is_ancestor_dir` matches whole path segments only (bug 4's ancestor
+    /// test): a dir is an ancestor of a file iff the file path begins with the
+    /// dir followed by a `/`. The repo root ("") is an ancestor of everything; a
+    /// dir is never its own ancestor; partial-segment prefixes don't match.
+    #[test]
+    fn is_ancestor_dir_matches_whole_segments() {
+        assert!(is_ancestor_dir("src", "src/main.rs"));
+        assert!(is_ancestor_dir("src", "src/repo/ssh.rs"));
+        assert!(is_ancestor_dir("src/repo", "src/repo/ssh.rs"));
+        assert!(is_ancestor_dir("", "anything/at/all.rs"), "root is ancestor of all");
+        // Not an ancestor:
+        assert!(!is_ancestor_dir("sr", "src/main.rs"), "partial segment must not match");
+        assert!(!is_ancestor_dir("src", "src"), "a dir is not its own ancestor");
+        assert!(!is_ancestor_dir("src", "lib/main.rs"));
+        assert!(!is_ancestor_dir("src/repo", "src/repo.rs"), "sibling file, not under dir");
+    }
+
+    /// END-TO-END (bug 4): opening a file nested under collapsed dirs makes the
+    /// tree EXPAND those ancestor dirs so the file row is rendered (and can then
+    /// be scrolled to). Build a repo with `deep/nested/leaf.txt`, open it via a
+    /// Path selection, render, and assert every ancestor dir's CollapsingState
+    /// is open and the leaf node's children were lazily loaded along the way.
+    #[test]
+    fn opening_nested_file_expands_ancestor_dirs() {
+        let (dir, git) = new_repo_dir();
+        std::fs::create_dir_all(dir.join("deep/nested")).unwrap();
+        std::fs::write(dir.join("deep/nested/leaf.txt"), "hi\n").unwrap();
+        std::fs::write(dir.join("top.txt"), "t\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+
+        let mut app = local_app(&dir);
+        app.poll_reload_blocking();
+        // Open the deeply-nested file (not a changed file — a tree open).
+        app.selected = Some(Selection::Path("deep/nested/leaf.txt".into()));
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 600.0))
+            .build_state(|ctx, app: &mut App| app.ui(ctx), app);
+        // A couple frames so the ancestor expansion + lazy child loads settle.
+        harness.run();
+        harness.run();
+        harness.run();
+
+        // The nested children only load when the ancestor dirs were expanded
+        // (render_tree's `body`/force-expand path). Walk the in-memory tree and
+        // confirm the chain down to leaf.txt was materialized.
+        let deep = harness
+            .state()
+            .tree_nodes
+            .iter()
+            .find(|n| n.rel == "deep")
+            .expect("deep dir node exists");
+        let nested = deep
+            .children
+            .as_ref()
+            .expect("deep/ children loaded → it was expanded")
+            .iter()
+            .find(|n| n.rel == "deep/nested")
+            .expect("nested dir node exists");
+        let leaf = nested
+            .children
+            .as_ref()
+            .expect("deep/nested/ children loaded → it was expanded")
+            .iter()
+            .find(|n| n.rel == "deep/nested/leaf.txt");
+        assert!(
+            leaf.is_some(),
+            "the open file's row must be reachable after ancestor dirs auto-expand"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `?` toggles the help overlay; Esc closes it. Driven through `app.ui`
@@ -4970,6 +5465,7 @@ mod ui_tests {
         app.poll_reload_blocking();
         app.files[0].hunks[0].status = ReviewStatus::Approved;
         app.save_review_state();
+        app.state_writer.flush();
 
         let state = ReviewState::load(&repo).expect("canonical mirror written for MCP");
         let h = state.files.iter().flat_map(|f| &f.hunks).next().unwrap();
