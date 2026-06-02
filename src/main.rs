@@ -9,6 +9,7 @@
 //! approve/deny review state, comments, symbol jump, the Claude agent pane.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use eframe::egui;
 use egui::Color32;
@@ -388,6 +389,12 @@ struct App {
     /// Local directory where review state (`.purview/`) is read/written. For a
     /// local repo this is the workdir; for SSH it's a local mirror dir.
     state_root: PathBuf,
+    /// Cached agent replies. Reloaded only when the replies directory's mtime
+    /// changes — NOT every frame (which previously did a full `read_dir` +
+    /// per-file read+parse on every paint). `replies_mtime` is the directory
+    /// mtime observed at the last load; `None` means "force a load".
+    replies_cache: Replies,
+    replies_mtime: Option<std::time::SystemTime>,
     /// Ctrl+P fuzzy file-open overlay state. Some = open.
     quick_open: Option<QuickOpen>,
     /// Go-to-definition overlay state. Some = open.
@@ -410,14 +417,17 @@ struct App {
     /// Lazy, per-row memoized highlight spans, parallel to `cache`. None =
     /// not yet highlighted. Interior mutability so the render closure (which
     /// borrows `&self`) can fill in newly-visible rows. egui is single-thread.
-    hl_cache: std::cell::RefCell<Vec<Option<Vec<(Color32, String)>>>>,
+    /// Spans are stored behind `Rc` so the hot per-row read path bumps a
+    /// refcount instead of deep-cloning the whole span vec (every `String`)
+    /// on each visible row, each frame.
+    hl_cache: std::cell::RefCell<Vec<Option<Rc<Vec<(Color32, String)>>>>>,
     /// Incremental highlighter for the full-file view: carries parser state
     /// across lines so block comments etc. color correctly, while only
     /// advancing as far as the user has scrolled. None for diff view (its
     /// rows aren't contiguous source — per-line highlighting is correct).
     incr: std::cell::RefCell<Option<IncrementalHl>>,
     /// Lazy memo for split-view rows: (left_spans, right_spans) per cache row.
-    split_cache: std::cell::RefCell<Vec<Option<(Spans, Spans)>>>,
+    split_cache: std::cell::RefCell<Vec<Option<(Rc<Spans>, Rc<Spans>)>>>,
     /// Keyboard-nav focus: which hunk (by hunk index) is "current" for n/p
     /// navigation and a/r/c actions.
     focus_hunk: usize,
@@ -569,6 +579,8 @@ impl App {
             extent: Extent::Summary,
             tree_nodes,
             state_root,
+            replies_cache: Replies::default(),
+            replies_mtime: None,
             quick_open: None,
             goto: None,
             selected_symbol: None,
@@ -1321,23 +1333,43 @@ impl App {
         };
     }
 
+    /// Refresh the cached replies, but only reparse when the replies directory
+    /// has actually changed. We compare one cheap `stat` (the directory mtime)
+    /// against the mtime observed at the last load; only on a change do we
+    /// `read_dir` + read+parse every reply file. Returns a reference to the
+    /// (possibly unchanged) cached replies.
+    ///
+    /// A missing directory (no replies posted yet) reads as `None` mtime; once
+    /// the first reply is written the directory appears (mtime Some), which is
+    /// a change and triggers the (cheap, one-file) load.
+    fn refresh_replies(&mut self) -> &Replies {
+        let dir = Replies::dir_for(&self.state_root);
+        let mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+        if mtime != self.replies_mtime {
+            self.replies_cache = Replies::load(&self.state_root);
+            self.replies_mtime = mtime;
+        }
+        &self.replies_cache
+    }
+
     /// Highlighted spans for cache row `i`, computed once and memoized.
     /// Diff rows are highlighted per-line (they're not contiguous source).
     /// Full-file rows are highlighted via the incremental stateful path,
     /// advancing from the last-highlighted line up to `i` so cross-line
     /// constructs color correctly — and never past what's been viewed.
-    fn row_spans(&self, i: usize) -> Vec<(Color32, String)> {
+    fn row_spans(&self, i: usize) -> Rc<Vec<(Color32, String)>> {
         if let Some(spans) = &self.hl_cache.borrow()[i] {
-            return spans.clone();
+            // Cache hit: clone the Rc (a refcount bump), not the span data.
+            return Rc::clone(spans);
         }
         match &self.cache[i] {
-            RenderRow::HunkHeader { .. } => Vec::new(),
+            RenderRow::HunkHeader { .. } => Rc::new(Vec::new()),
             RenderRow::DiffLine { text, .. } => {
-                let spans = self.hl.highlight_line(&self.cache_path, text);
-                self.hl_cache.borrow_mut()[i] = Some(spans.clone());
+                let spans = Rc::new(self.hl.highlight_line(&self.cache_path, text));
+                self.hl_cache.borrow_mut()[i] = Some(Rc::clone(&spans));
                 spans
             }
-            RenderRow::SplitLine { .. } => Vec::new(),
+            RenderRow::SplitLine { .. } => Rc::new(Vec::new()),
             RenderRow::Plain { .. } => self.highlight_full_file_upto(i),
         }
     }
@@ -1345,9 +1377,10 @@ impl App {
     /// Lazily highlighted (left, right) spans for a split-view row `i`,
     /// memoized. Each side is highlighted per-line (diff fragments aren't
     /// contiguous source).
-    fn split_spans(&self, i: usize) -> (Spans, Spans) {
+    fn split_spans(&self, i: usize) -> (Rc<Spans>, Rc<Spans>) {
         if let Some(pair) = &self.split_cache.borrow()[i] {
-            return pair.clone();
+            // Cache hit: clone the two Rcs (refcount bumps), not the span data.
+            return (Rc::clone(&pair.0), Rc::clone(&pair.1));
         }
         let (left, right) = match &self.cache[i] {
             RenderRow::SplitLine { left, right } => {
@@ -1359,17 +1392,17 @@ impl App {
                     .as_ref()
                     .map(|(_, t, _)| self.hl.highlight_line(&self.cache_path, t))
                     .unwrap_or_default();
-                (l, r)
+                (Rc::new(l), Rc::new(r))
             }
-            _ => (Vec::new(), Vec::new()),
+            _ => (Rc::new(Vec::new()), Rc::new(Vec::new())),
         };
-        self.split_cache.borrow_mut()[i] = Some((left.clone(), right.clone()));
+        self.split_cache.borrow_mut()[i] = Some((Rc::clone(&left), Rc::clone(&right)));
         (left, right)
     }
 
     /// Advance the incremental highlighter through rows [next..=i], caching
     /// each, then return row `i`'s spans.
-    fn highlight_full_file_upto(&self, i: usize) -> Vec<(Color32, String)> {
+    fn highlight_full_file_upto(&self, i: usize) -> Rc<Vec<(Color32, String)>> {
         let mut incr = self.incr.borrow_mut();
         let st = incr.get_or_insert_with(|| self.hl.new_incremental(&self.cache_path));
         let mut hl = self.hl_cache.borrow_mut();
@@ -1380,10 +1413,10 @@ impl App {
                 _ => "",
             };
             let spans = self.hl.highlight_incremental(st, text);
-            hl[n] = Some(spans);
+            hl[n] = Some(Rc::new(spans));
             st.next += 1;
         }
-        hl[i].clone().unwrap_or_default()
+        hl[i].clone().unwrap_or_else(|| Rc::new(Vec::new()))
     }
 }
 
@@ -2248,10 +2281,19 @@ impl App {
         let mut edit_start: Option<(usize, String)> = None;
         let mut edit_commit: Option<(usize, String)> = None;
         let mut edit_cancel = false;
-        // Agent replies, loaded once per frame (tiny dir). Used for both the
-        // per-hunk indicator and the open thread. Poll while a changed file is
-        // shown so a reply posted by the agent surfaces without interaction.
-        let replies = Replies::load(&self.state_root);
+        // Agent replies. Used for both the per-hunk indicator and the open
+        // thread. We no longer `read_dir` + read+parse every reply file every
+        // frame: `refresh_replies` does one cheap directory-mtime `stat` and
+        // only reloads when it changed (see C1). The clone here is of the
+        // already-in-memory cache (cheap, bounded by reply count) so the render
+        // closures can borrow `self` freely below.
+        let replies = self.refresh_replies().clone();
+        // Poll cadence: while a changed file is shown, schedule a modest repaint
+        // so a reply written externally (by the MCP agent) surfaces within ~2s
+        // WITHOUT user interaction. On that wakeup `refresh_replies` does just
+        // the cheap mtime stat — it reparses only if the directory changed. So
+        // idle frames cost one stat, not N file reads. (The old code reparsed
+        // every reply file every frame and forced the same 2s repaint.)
         if active_file.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs(2));
         }

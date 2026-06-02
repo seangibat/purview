@@ -1,6 +1,8 @@
 //! Syntect-backed syntax highlighting → egui colors.
 
 use egui::Color32;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
     HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style, ThemeSet,
@@ -22,6 +24,19 @@ pub struct IncrementalHl {
 pub struct Highlighter {
     syntaxes: SyntaxSet,
     theme: syntect::highlighting::Theme,
+    /// The syntect highlighter (theme → style index), built ONCE. It only
+    /// depends on the theme, so we construct it a single time instead of
+    /// rebuilding the scope-selector index on every incremental line.
+    ///
+    /// It borrows a `Theme`; rather than tie a lifetime to `self.theme`
+    /// (which would make this struct self-referential), we own a leaked
+    /// clone of the theme. One leak for the lifetime of the program (a single
+    /// `Highlighter` lives in `App`) — negligible and never freed by design.
+    syn_hl: SynHighlighter<'static>,
+    /// Memoizes `ensure_contrast` over the (fixed) dark bg: each distinct
+    /// token foreground color is lifted once, not per token. Interior
+    /// mutability so the highlight methods (`&self`) can fill it in.
+    contrast_memo: RefCell<HashMap<Color32, Color32>>,
 }
 
 impl Highlighter {
@@ -29,7 +44,33 @@ impl Highlighter {
         let syntaxes = SyntaxSet::load_defaults_newlines();
         let themes = ThemeSet::load_defaults();
         let theme = themes.themes["base16-mocha.dark"].clone();
-        Highlighter { syntaxes, theme }
+        // Build the scope-selector index once. `SynHighlighter` borrows a
+        // theme for its whole life; leak a clone so it can be `'static` and
+        // stored alongside `theme` without a self-referential borrow.
+        let leaked_theme: &'static syntect::highlighting::Theme =
+            Box::leak(Box::new(theme.clone()));
+        let syn_hl = SynHighlighter::new(leaked_theme);
+        Highlighter {
+            syntaxes,
+            theme,
+            syn_hl,
+            contrast_memo: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Map a syntect style to an egui color with the contrast floor applied,
+    /// memoizing the (input color → lifted color) mapping. The lift depends
+    /// only on the input color and the fixed `DARK_BG`, so each color is
+    /// computed once and reused.
+    fn color_for(&self, style: Style) -> Color32 {
+        let c = style.foreground;
+        let key = Color32::from_rgb(c.r, c.g, c.b);
+        if let Some(out) = self.contrast_memo.borrow().get(&key) {
+            return *out;
+        }
+        let out = ensure_contrast(key, DARK_BG);
+        self.contrast_memo.borrow_mut().insert(key, out);
+        out
     }
 
     fn syntax_for(&self, path: &str) -> &SyntaxReference {
@@ -57,7 +98,7 @@ impl Highlighter {
             .map(|line| match h.highlight_line(line, &self.syntaxes) {
                 Ok(ranges) => ranges
                     .into_iter()
-                    .map(|(style, text)| (to_color(style), text.to_string()))
+                    .map(|(style, text)| (self.color_for(style), text.to_string()))
                     .collect(),
                 Err(_) => vec![(Color32::GRAY, line.to_string())],
             })
@@ -68,10 +109,9 @@ impl Highlighter {
     /// order to [`highlight_incremental`]; state carries across them.
     pub fn new_incremental(&self, path: &str) -> IncrementalHl {
         let syntax = self.syntax_for(path);
-        let syn_hl = SynHighlighter::new(&self.theme);
         IncrementalHl {
             parse: ParseState::new(syntax),
-            hi: HighlightState::new(&syn_hl, ScopeStack::new()),
+            hi: HighlightState::new(&self.syn_hl, ScopeStack::new()),
             next: 0,
         }
     }
@@ -79,13 +119,12 @@ impl Highlighter {
     /// Highlight the next line, advancing `st`'s parser state. Must be called
     /// in line order for correct results.
     pub fn highlight_incremental(&self, st: &mut IncrementalHl, line: &str) -> Spans {
-        let syn_hl = SynHighlighter::new(&self.theme);
         let ops = match st.parse.parse_line(line, &self.syntaxes) {
             Ok(ops) => ops,
             Err(_) => return vec![(Color32::GRAY, line.to_string())],
         };
-        HighlightIterator::new(&mut st.hi, &ops, line, &syn_hl)
-            .map(|(style, text)| (to_color(style), text.to_string()))
+        HighlightIterator::new(&mut st.hi, &ops, line, &self.syn_hl)
+            .map(|(style, text)| (self.color_for(style), text.to_string()))
             .collect()
     }
 
@@ -97,7 +136,7 @@ impl Highlighter {
         match h.highlight_line(line, &self.syntaxes) {
             Ok(ranges) => ranges
                 .into_iter()
-                .map(|(style, text)| (to_color(style), text.to_string()))
+                .map(|(style, text)| (self.color_for(style), text.to_string()))
                 .collect(),
             Err(_) => vec![(Color32::GRAY, line.to_string())],
         }
@@ -110,11 +149,6 @@ impl Highlighter {
 /// token color's luminance against THIS bg so nothing renders illegibly dark
 /// (see [`ensure_contrast`]).
 const DARK_BG: Color32 = Color32::from_rgb(24, 24, 24);
-
-fn to_color(style: Style) -> Color32 {
-    let c = style.foreground;
-    ensure_contrast(Color32::from_rgb(c.r, c.g, c.b), DARK_BG)
-}
 
 /// Relative luminance (WCAG sRGB) of a color in 0.0..=1.0. Used as the
 /// perceived-brightness measure for the contrast floor.
@@ -246,6 +280,34 @@ mod tests {
             lifted.b() >= lifted.r() && lifted.b() >= lifted.g(),
             "blue should remain the dominant channel after lifting: {lifted:?}"
         );
+    }
+
+    /// The memoized `color_for` must return exactly what the unmemoized
+    /// `ensure_contrast` would, for both a fresh and a repeated lookup (so the
+    /// memo can't drift from the source of truth).
+    #[test]
+    fn color_for_memo_matches_ensure_contrast() {
+        use syntect::highlighting::{Color, FontStyle};
+        let hl = Highlighter::new();
+        let samples = [
+            Color { r: 10, g: 10, b: 12, a: 255 },   // near-black: lifted
+            Color { r: 220, g: 200, b: 120, a: 255 }, // bright: unchanged
+            Color { r: 10, g: 20, b: 60, a: 255 },    // dark blue: lifted
+            Color { r: 255, g: 255, b: 255, a: 255 }, // white
+        ];
+        for c in samples {
+            let style = Style {
+                foreground: c,
+                background: c,
+                font_style: FontStyle::empty(),
+            };
+            let key = Color32::from_rgb(c.r, c.g, c.b);
+            let expected = ensure_contrast(key, DARK_BG);
+            // First (cold) lookup populates the memo.
+            assert_eq!(hl.color_for(style), expected);
+            // Second (warm) lookup must return the identical value.
+            assert_eq!(hl.color_for(style), expected);
+        }
     }
 
     #[test]

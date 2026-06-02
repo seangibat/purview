@@ -575,6 +575,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Mirrors `App::refresh_replies`'s mtime-gating (C1): a reload happens
+    /// only when the replies directory's mtime changes. Before any reply the
+    /// dir is absent (mtime None); after appending one the dir exists (mtime
+    /// Some) — a change — and a (re)load surfaces it. Re-checking without a
+    /// change must NOT reload (cache stays put). Appending again changes the
+    /// mtime and the next load picks the new reply up.
+    #[test]
+    fn replies_reload_only_on_dir_mtime_change() {
+        let root = tmp_dir("replies-mtime");
+        let dir = Replies::dir_for(&root);
+
+        // The same cheap stat App::refresh_replies uses.
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+
+        // Initial state: no replies dir yet → mtime None, cache empty.
+        let mut cached = Replies::default();
+        let mut last_mtime: Option<std::time::SystemTime> = mtime(&dir);
+        assert!(last_mtime.is_none(), "dir should not exist before first append");
+        assert_eq!(cached.replies.len(), 0);
+
+        // Append one reply — the dir now exists, so mtime changes (None→Some).
+        Replies::append(
+            &root,
+            Reply {
+                file: "src/a.rs".into(),
+                hunk_header: "@@ -9 +9 @@".into(),
+                text: "first".into(),
+                anchor: String::new(),
+            },
+        )
+        .unwrap();
+        let m1 = mtime(&dir);
+        assert_ne!(m1, last_mtime, "appending the first reply must change the dir mtime");
+        // mtime changed → reload.
+        cached = Replies::load(&root);
+        last_mtime = m1;
+        assert_eq!(cached.replies.len(), 1, "reload after change must see the reply");
+
+        // Re-check with NO change: mtime equal → must NOT reload. Prove the
+        // gate holds by clobbering the cache and confirming the gate leaves it.
+        let sentinel = Replies { replies: vec![] };
+        cached = sentinel;
+        let m_same = mtime(&dir);
+        if m_same != last_mtime {
+            cached = Replies::load(&root);
+            last_mtime = m_same;
+        }
+        assert_eq!(cached.replies.len(), 0, "unchanged mtime must not trigger a reload");
+
+        // Some filesystems have coarse (1s) mtime granularity; ensure the next
+        // write lands in a distinct mtime tick so the change is observable.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        Replies::append(
+            &root,
+            Reply {
+                file: "src/a.rs".into(),
+                hunk_header: "@@ -9 +9 @@".into(),
+                text: "second".into(),
+                anchor: String::new(),
+            },
+        )
+        .unwrap();
+        let m2 = mtime(&dir);
+        assert_ne!(m2, last_mtime, "a second append must change the dir mtime again");
+        cached = Replies::load(&root);
+        assert_eq!(cached.replies.len(), 2, "reload after second change sees both replies");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn load_missing_is_empty_not_error() {
         let dir = tmp_dir("missing");
