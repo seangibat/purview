@@ -71,6 +71,7 @@ fn bench_replies_load(c: &mut Criterion) {
                 file: format!("src/file_{}.rs", i % 20),
                 hunk_header: format!("@@ -{i} +{i} @@"),
                 text: format!("reply number {i} with some explanatory text"),
+                anchor: String::new(),
             },
         )
         .unwrap();
@@ -97,10 +98,13 @@ fn bench_state_serialize(c: &mut Criterion) {
                         header: format!("@@ -{h},5 +{h},9 @@ fn thing_{h}()"),
                         status: if h % 2 == 0 { "approved" } else { "unreviewed" }.into(),
                         comment: None,
+                        anchor: String::new(),
+                        changed_since_review: false,
                     })
                     .collect(),
             })
             .collect(),
+        orphaned: Vec::new(),
     };
     c.bench_function("state_serialize_300_files", |b| {
         b.iter_batched(
